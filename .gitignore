@@ -1,0 +1,15 @@
+/release/
+/dist/
+/data/
+/backups/
+**/data/
+/verification/*.exe
+/verification/*.png
+/verification/*.txt
+/verification/image-fixture/
+*.pdb
+*.log
+*.zip
+*.bak
+.vs/
+.vscode/
