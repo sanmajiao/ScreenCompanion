@@ -77,6 +77,7 @@ namespace ScreenCompanion
         private DesktopPortal.DesktopLayerForm desktop;
         private SwitcherForm switcher;
         private TrayMirrorForm trayMirror;
+        private StartMenuController startMenu;
         private SettingsForm settings;
         private readonly System.Windows.Forms.Timer topologyTimer=new System.Windows.Forms.Timer();
         private string topology="";
@@ -111,6 +112,7 @@ namespace ScreenCompanion
             CloseFeatures(); topology=Topology();
             if(Settings.TargetScreen()!=null)
             {
+                startMenu=new StartMenuController(dispatcher);
                 if(Settings.Current.Desktop) { desktop=new DesktopPortal.DesktopLayerForm();desktop.Show(); }
                 if(Settings.Current.AltTab) { switcher=new SwitcherForm();switcher.Initialize(); }
                 if(Settings.Current.Tray) { trayMirror=new TrayMirrorForm(ShowSettings);trayMirror.Show(); }
@@ -119,6 +121,7 @@ namespace ScreenCompanion
         }
         private void CloseFeatures()
         {
+            if(startMenu!=null){startMenu.Dispose();startMenu=null;}
             if(desktop!=null){desktop.Close();desktop.Dispose();desktop=null;}
             if(switcher!=null){switcher.Close();switcher.Dispose();switcher=null;}
             if(trayMirror!=null){trayMirror.Close();trayMirror.Dispose();trayMirror=null;}

@@ -13,8 +13,8 @@ namespace ScreenCompanion
             public WindowEntry Window; public IntPtr Thumbnail; public Rectangle Bounds,Image,Close;
         }
         private readonly List<Card> cards=new List<Card>();
-        private Native.HookProc hookProc;
-        private IntPtr hook;
+        private KeyboardListener keyboard;
+        private bool hookSequence;
         private bool sequence,pinned,activating;
         private bool keyboardMove;
         private int keyboardAttempts;
@@ -56,7 +56,7 @@ namespace ScreenCompanion
             MouseWheel+=delegate(object s,MouseEventArgs e){if(cards.Count>pageSize){page=Math.Max(0,Math.Min((cards.Count-1)/pageSize,page+(e.Delta<0?1:-1)));LayoutCards();}};
             FormClosing+=delegate
             {
-                if(hook!=IntPtr.Zero){Native.UnhookWindowsHookEx(hook);hook=IntPtr.Zero;}
+                if(keyboard!=null){keyboard.Dispose();keyboard=null;}
                 activateTimer.Stop();guardTimer.Stop();activateTimer.Dispose();guardTimer.Dispose();ClearCards();titleFont.Dispose();
             };
         }
@@ -64,26 +64,18 @@ namespace ScreenCompanion
         protected override CreateParams CreateParams {get{var c=base.CreateParams;c.ExStyle|=0x80|0x08000000;return c;}}
         internal void Initialize()
         {
-            IntPtr h=Handle;hookProc=Hook;hook=Native.SetWindowsHookEx(13,hookProc,Native.GetModuleHandle(null),0);
-            if(hook==IntPtr.Zero)throw new InvalidOperationException("无法注册 Alt+Tab 监听。");
+            IntPtr h=Handle;keyboard=new KeyboardListener(ObserveKey);
         }
-        private IntPtr Hook(int code,IntPtr w,IntPtr l)
+        private void ObserveKey(Native.KeyboardData d,bool down,bool up)
         {
-            if(code>=0)
-            {
-                var d=(Native.KeyboardData)Marshal.PtrToStructure(l,typeof(Native.KeyboardData));
-                bool down=w==new IntPtr(0x100)||w==new IntPtr(0x104),up=w==new IntPtr(0x101)||w==new IntPtr(0x105);
                 if(down && d.Key==9 && ((d.Flags&0x20)!=0 || Native.KeyPressed(0x12)))
                 {
-                    bool reverse=Native.KeyPressed(0x10);bool fresh=!sequence;sequence=true;
-                    Queue(delegate {if(!activating)Advance(fresh,reverse);});
+                    bool reverse=Native.KeyPressed(0x10);bool fresh=!hookSequence;hookSequence=true;
+                    Queue(delegate {if(!activating && Native.KeyPressed(0x12)){sequence=true;Advance(fresh,reverse);}});
                 }
                 else if(up && (d.Key==0x12 || d.Key==0xA4 || d.Key==0xA5))
-                {bool completed=sequence;sequence=false;Queue(delegate{if(!pinned){Dismiss();if(completed && !activating && Settings.Current.MoveOnSwitch){keyboardMove=true;keyboardAttempts=0;activateTimer.Start();}}});}
-                else if(down && d.Key==27){sequence=false;Queue(delegate{if(keyboardMove){keyboardMove=false;activateTimer.Stop();}Dismiss();});}
-            }
-            // Listening only; Windows keeps its native keyboard switching.
-            return Native.CallNextHookEx(hook,code,w,l);
+                {bool completed=hookSequence;hookSequence=false;Queue(delegate{sequence=false;if(!pinned){Dismiss();if(completed && !activating && Settings.Current.MoveOnSwitch){keyboardMove=true;keyboardAttempts=0;activateTimer.Start();}}});}
+                else if(down && d.Key==27){hookSequence=false;Queue(delegate{sequence=false;if(keyboardMove){keyboardMove=false;activateTimer.Stop();}Dismiss();});}
         }
         private void Queue(Action a){try{if(!IsDisposed)BeginInvoke(a);}catch{}}
         internal void OpenPinned(){pinned=true;sequence=false;LoadCards();selected=0;Present();}

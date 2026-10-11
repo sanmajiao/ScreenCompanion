@@ -12,6 +12,7 @@ namespace ScreenCompanion
         private readonly System.Windows.Forms.Timer cursorTimer=new System.Windows.Forms.Timer();
         private readonly System.Windows.Forms.Timer revealTimer=new System.Windows.Forms.Timer();
         private readonly System.Windows.Forms.Timer popupTimer=new System.Windows.Forms.Timer();
+        private readonly TrayPopupTracker flyouts=new TrayPopupTracker();
         private Rectangle source=Rectangle.Empty;
         private Point returnCursor;
         private bool forwarding;
@@ -20,6 +21,10 @@ namespace ScreenCompanion
         private MouseButtons pendingButton;
         private int revealAttempts;
         private Point revealPoint;
+        private Rectangle stableSource;
+        private int sourceStableSince;
+        private bool clickDelivered;
+        private int capturePausedUntil=Environment.TickCount;
         private bool openingOverflow;
         private int clickStarted;
         private IntPtr movedPopup;
@@ -35,6 +40,8 @@ namespace ScreenCompanion
         internal int LastPopupLatency=-1;
         internal int ForwardCount;
         internal Point LastClickPoint;
+        internal IntPtr LastInputTarget;
+        internal bool LastInputSucceeded;
         private readonly Label gear=new Label();
         private IntPtr taskbarHost;
         private int lastFrame;
@@ -50,24 +57,41 @@ namespace ScreenCompanion
             var tip=new ToolTip();tip.SetToolTip(gear,"副屏助手设置");tip.SetToolTip(picture,"真实系统托盘 · 支持左键、右键和双击\n箭头在副屏展开真实隐藏图标菜单，菜单图标可直接操作。\n主屏隐藏时保留图标画面，点击会先展开真实托盘。");
             picture.MouseUp+=Forward;
             timer.Interval=32;timer.Tick+=delegate{if(!forwarding)CaptureTray();};
-            cursorTimer.Interval=25;cursorTimer.Tick+=delegate{cursorTimer.Stop();if(forwarding){Native.SetCursorPos(returnCursor.X,returnCursor.Y);forwarding=false;}CaptureTray();};
+            cursorTimer.Interval=200;cursorTimer.Tick+=delegate{cursorTimer.Stop();if(!clickDelivered)CaptureTray();if(forwarding){if(Cursor.Position==LastClickPoint || Cursor.Position==revealPoint)Native.SetCursorPos(returnCursor.X,returnCursor.Y);forwarding=false;capturePausedUntil=Environment.TickCount+450;}clickDelivered=false;};
             popupTimer.Interval=16;popupTimer.Tick+=delegate{TrackOverflow();};
             revealTimer.Interval=16;revealTimer.Tick+=delegate
             {
                 source=FindTrayBounds();
                 if(SourceVisible(source))
                 {
+                    // The auto-hide rectangle reaches its final position before
+                    // the XAML buttons finish animating. Wait for stable geometry
+                    // and a real taskbar hit instead of clicking the desktop behind it.
+                    if(stableSource!=source){stableSource=source;sourceStableSince=Environment.TickCount;}
+                    Point hover=pendingClick?MapPoint(pendingX,pendingY,source):revealPoint;
+                    if(Cursor.Position!=revealPoint){revealTimer.Stop();pendingClick=false;forwarding=false;return;}
+                    if(hover!=revealPoint){Native.SetCursorPos(hover.X,hover.Y);revealPoint=hover;}
+                    IntPtr taskbar=Native.FindWindow("Shell_TrayWnd",null);
+                    bool hit=Native.GetAncestor(Native.WindowFromPoint(hover),2)==taskbar;
+                    if(Environment.TickCount-sourceStableSince<120 || !hit)
+                    {
+                        if(++revealAttempts<100)return;
+                        revealTimer.Stop();pendingClick=false;Text="真实托盘尚未就绪，点击重试";cursorTimer.Start();return;
+                    }
                     revealTimer.Stop();
                     if(pendingClick && Cursor.Position==revealPoint)
                     {
-                        Point p=MapPoint(pendingX,pendingY,source);LastClickPoint=p;Native.Click(p,pendingButton);
+                        Point p=MapPoint(pendingX,pendingY,source);LastClickPoint=p;LastInputTarget=Native.WindowFromPoint(p);
+                        CaptureTray();
+                        flyouts.Begin(p,returnCursor);LastInputSucceeded=Native.Click(p,pendingButton);
+                        clickDelivered=LastInputSucceeded;
                     }
                     pendingClick=false;cursorTimer.Start();
                 }
                 else if(++revealAttempts>=75){revealTimer.Stop();pendingClick=false;Text="托盘未能展开，点击重试";cursorTimer.Start();}
             };
             Shown+=delegate{InstallPopupHooks();CaptureTray();timer.Start();};
-            FormClosing+=delegate{timer.Stop();cursorTimer.Stop();revealTimer.Stop();popupTimer.Stop();RestoreOverflow();StopPopupHooks();timer.Dispose();cursorTimer.Dispose();revealTimer.Dispose();popupTimer.Dispose();if(forwarding)Native.SetCursorPos(returnCursor.X,returnCursor.Y);if(picture.Image!=null){picture.Image.Dispose();picture.Image=null;}if(lastTrayFrame!=null)lastTrayFrame.Dispose();tip.Dispose();};
+            FormClosing+=delegate{timer.Stop();cursorTimer.Stop();revealTimer.Stop();popupTimer.Stop();RestoreOverflow();StopPopupHooks();flyouts.Dispose();timer.Dispose();cursorTimer.Dispose();revealTimer.Dispose();popupTimer.Dispose();if(forwarding)Native.SetCursorPos(returnCursor.X,returnCursor.Y);if(picture.Image!=null){picture.Image.Dispose();picture.Image=null;}if(lastTrayFrame!=null)lastTrayFrame.Dispose();tip.Dispose();};
         }
         protected override bool ShowWithoutActivation{get{return true;}}
         protected override CreateParams CreateParams{get{var p=base.CreateParams;p.ExStyle|=0x80|0x08000000|0x80000;return p;}}
@@ -111,7 +135,7 @@ namespace ScreenCompanion
                 else if(Visible)RefreshHiddenClock();
                 return;
             }
-            if(Environment.TickCount-lastFrame<120 && picture.Image!=null)return;
+            if(Environment.TickCount-capturePausedUntil<0 || (Environment.TickCount-lastFrame<120 && picture.Image!=null))return;
             lastFrame=Environment.TickCount;Text="副屏真实托盘";
             Bitmap image=null;
             try
@@ -208,13 +232,10 @@ namespace ScreenCompanion
             // Recheck the source; a layout change must never click a stale coordinate.
             Rectangle live=FindTrayBounds();
             pendingX=e.X/(float)Math.Max(1,picture.Width);pendingY=e.Y/(float)Math.Max(1,picture.Height);pendingButton=e.Button;
-            if(!SourceVisible(live)){BeginReveal(true);return;}
             source=live;
-            Point point=MapPoint(pendingX,pendingY,source);
-            LastClickPoint=point;
-            returnCursor=Cursor.Position;forwarding=true;
-            if(!Native.Click(point,e.Button)){forwarding=false;Native.SetCursorPos(returnCursor.X,returnCursor.Y);return;}
-            cursorTimer.Start();
+            // Dispatch after the original MouseUp has released all capture and
+            // after the native primary taskbar is ready to receive the input.
+            BeginReveal(true);
         }
         private static bool SourceVisible(Rectangle r)
         {
@@ -292,6 +313,10 @@ namespace ScreenCompanion
                     {
                         if(!IsContextMenuWindow(Native.WindowFromPoint(m.Point)))QueuePopupClose();
                     }
+                    else if(Native.Bounds(movedPopup).Contains(m.Point))
+                    {
+                        Point clicked=m.Point;try{BeginInvoke(new Action(delegate{flyouts.Begin(clicked,clicked);}));}catch{}
+                    }
                 }
                 return Native.CallNextHookEx(popupMouseHook,code,w,l);
             };
@@ -345,9 +370,10 @@ namespace ScreenCompanion
             if(forwarding)return;
             IntPtr taskbar=Native.FindWindow("Shell_TrayWnd",null);if(taskbar==IntPtr.Zero)return;
             Rectangle b=Screen.FromHandle(taskbar).Bounds,tr=Native.Bounds(taskbar);
-            returnCursor=Cursor.Position;pendingClick=click;revealAttempts=0;forwarding=true;
+            returnCursor=Cursor.Position;pendingClick=click;revealAttempts=0;forwarding=true;stableSource=Rectangle.Empty;
             int x=Math.Max(b.Left,Math.Min(b.Right-2,tr.Right-70));int y=Math.Max(b.Top,Math.Min(b.Bottom-1,tr.Top+2));
             if(tr.Height>tr.Width){x=Math.Max(b.Left,Math.Min(b.Right-1,tr.Left+2));y=Math.Max(b.Top,Math.Min(b.Bottom-2,tr.Bottom-70));}
+            Rectangle live=FindTrayBounds();if(click && SourceVisible(live)){Point point=MapPoint(pendingX,pendingY,live);x=point.X;y=point.Y;}
             revealPoint=new Point(x,y);Native.SetCursorPos(x,y);Text="正在展开真实托盘…";revealTimer.Start();
         }
     }
