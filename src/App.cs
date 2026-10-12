@@ -14,7 +14,7 @@ namespace ScreenCompanion
     {
         public string ScreenName="";
         public bool Desktop=true, AltTab=true, Tray=true;
-        public bool MoveOnSwitch=false,TransparentTray=true;
+        public bool MoveOnSwitch=false,TransparentTray=true,HighResponse=false;
         public int ImageQuality=1;
         public int TrayWidth=520;
         public static readonly string DataDirectory=GetDataDirectory();
@@ -28,10 +28,10 @@ namespace ScreenCompanion
         public static Settings Load()
         {
             var s=new Settings();
-            try { foreach(string line in File.ReadAllLines(FileName,Encoding.UTF8)) { int pos=line.IndexOf('='); if(pos<0)continue; string k=line.Substring(0,pos),v=line.Substring(pos+1); switch(k) { case "screen":s.ScreenName=v;break;case "desktop":s.Desktop=v!="0";break;case "alttab":s.AltTab=v!="0";break;case "tray":s.Tray=v!="0";break;case "moveOnSwitch":s.MoveOnSwitch=v=="1";break;case "transparentTray":s.TransparentTray=v!="0";break;case "imageQuality":int q;if(Int32.TryParse(v,out q))s.ImageQuality=Math.Max(0,Math.Min(2,q));break;case "trayWidth":int n;if(Int32.TryParse(v,out n))s.TrayWidth=Math.Max(220,Math.Min(1200,n));break; } } } catch { }
+            try { foreach(string line in File.ReadAllLines(FileName,Encoding.UTF8)) { int pos=line.IndexOf('='); if(pos<0)continue; string k=line.Substring(0,pos),v=line.Substring(pos+1); switch(k) { case "screen":s.ScreenName=v;break;case "highResponse":s.HighResponse=v=="1";break;case "desktop":s.Desktop=v!="0";break;case "alttab":s.AltTab=v!="0";break;case "tray":s.Tray=v!="0";break;case "moveOnSwitch":s.MoveOnSwitch=v=="1";break;case "transparentTray":s.TransparentTray=v!="0";break;case "imageQuality":int q;if(Int32.TryParse(v,out q))s.ImageQuality=Math.Max(0,Math.Min(2,q));break;case "trayWidth":int n;if(Int32.TryParse(v,out n))s.TrayWidth=Math.Max(220,Math.Min(1200,n));break; } } } catch { }
             return s;
         }
-        public void Save() { File.WriteAllLines(FileName,new[]{"screen="+ScreenName,"desktop="+(Desktop?1:0),"alttab="+(AltTab?1:0),"tray="+(Tray?1:0),"trayWidth="+TrayWidth,"moveOnSwitch="+(MoveOnSwitch?1:0),"transparentTray="+(TransparentTray?1:0),"imageQuality="+ImageQuality},Encoding.UTF8); }
+        public void Save() { File.WriteAllLines(FileName,new[]{"screen="+ScreenName,"highResponse="+(HighResponse?1:0),"desktop="+(Desktop?1:0),"alttab="+(AltTab?1:0),"tray="+(Tray?1:0),"trayWidth="+TrayWidth,"moveOnSwitch="+(MoveOnSwitch?1:0),"transparentTray="+(TransparentTray?1:0),"imageQuality="+ImageQuality},Encoding.UTF8); }
         internal static Settings Current;
         internal static Screen TargetScreen()
         {
@@ -157,7 +157,7 @@ namespace ScreenCompanion
     {
         private readonly CompanionContext context;
         private readonly ComboBox screens=new ComboBox();
-        private readonly CheckBox desktop=new CheckBox(),alt=new CheckBox(),tray=new CheckBox(),move=new CheckBox(),transparent=new CheckBox();
+        private readonly CheckBox desktop=new CheckBox(),alt=new CheckBox(),tray=new CheckBox(),move=new CheckBox(),transparent=new CheckBox(),highResponse=new CheckBox();
         private readonly ComboBox quality=new ComboBox();
         private readonly ToolTip help=new ToolTip();
         private readonly NumericUpDown width=new NumericUpDown();
@@ -170,7 +170,12 @@ namespace ScreenCompanion
             var layout=new TableLayoutPanel{Dock=DockStyle.Top,AutoSize=true,ColumnCount=1,Padding=new Padding(24),GrowStyle=TableLayoutPanelGrowStyle.AddRows};layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent,100));Controls.Add(layout);
             AddRow(layout,new Label{Text="一个入口，管理你的副屏",Font=new Font(Font.FontFamily,19,FontStyle.Bold),AutoSize=true});
             AddRow(layout,new Label{Text="桌面克隆 · Alt+Tab 窗口面板 · 真实系统托盘",AutoSize=true,ForeColor=Color.DimGray});
-            AddRow(layout,new Label{Text="目标副屏",AutoSize=true});screens.DropDownStyle=ComboBoxStyle.DropDownList;screens.Dock=DockStyle.Fill;AddRow(layout,screens);
+            AddRow(layout,new Label{Text="目标副屏",AutoSize=true});screens.DropDownStyle=ComboBoxStyle.DropDownList;
+            var screenRow=new FlowLayoutPanel{AutoSize=true,Dock=DockStyle.Fill,WrapContents=false};screens.Width=590;screens.Margin=Padding.Empty;screenRow.Controls.Add(screens);
+            screenRow.SizeChanged+=delegate{screens.Width=Math.Max(120,screenRow.ClientSize.Width);};AddRow(layout,screenRow);
+            highResponse.Text="高响应模式：更快刷新与切换（增加内存和 CPU 占用）";AddRow(layout,highResponse);
+            help.SetToolTip(highResponse,"缩短桌面、窗口切换、托盘和开始菜单的响应等待，并缓存近期桌面图片。\n额外桌面图像缓存最多 16 MiB；托盘像素缓冲最多 8 MiB，通常不到 1 MiB。\n这是缓存上限，不是程序总内存；窗口预览由 Windows 管理，实际总占用因桌面内容而异。\n默认关闭；卡顿时可勾选并应用。真实任务栏展开动画仍需等待，不能保证所有电脑无延迟。");
+            AddRow(layout,new Label{Text="额外图片 / 像素缓存上限约 24 MiB；悬停开关查看说明。",AutoSize=true,ForeColor=Color.DimGray});
             desktop.Text="桌面克隆：打开文件，拖动图标保存布局";AddRow(layout,desktop);
             alt.Text="Alt+Tab：实时预览，点击切换或正常关闭";AddRow(layout,alt);
             move.Text="切换时将选中的窗口直接移到目标副屏";AddRow(layout,move);help.SetToolTip(move,"勾选后，点击卡片或按 Alt+Tab 后松开 Alt，会把实际选中的窗口移到上方选择的副屏。\n保留最大化状态；取消勾选后只切换窗口。");
@@ -189,20 +194,25 @@ namespace ScreenCompanion
             {
                 if(screens.SelectedItem is ScreenChoice)Settings.Current.ScreenName=((ScreenChoice)screens.SelectedItem).Device;
                 Settings.Current.Desktop=desktop.Checked;Settings.Current.AltTab=alt.Checked;Settings.Current.Tray=tray.Checked;Settings.Current.TrayWidth=(int)width.Value;
-                Settings.Current.MoveOnSwitch=move.Checked;Settings.Current.TransparentTray=transparent.Checked;Settings.Current.ImageQuality=Math.Max(0,quality.SelectedIndex);
+                Settings.Current.MoveOnSwitch=move.Checked;Settings.Current.TransparentTray=transparent.Checked;Settings.Current.ImageQuality=Math.Max(0,quality.SelectedIndex);Settings.Current.HighResponse=highResponse.Checked;
                 try { Settings.Current.Save();context.Apply();status.Text="设置已保存。关闭这个窗口后，副屏功能继续运行。"; }
                 catch(Exception e) { MessageBox.Show("设置未能保存："+e.Message,"副屏助手"); }
             };
             var hide=new Button{Text="收起到托盘",AutoSize=true,MinimumSize=new Size(120,38)};hide.Click+=delegate{Hide();};buttons.Controls.Add(hide);
             var exit=new Button{Text="退出",AutoSize=true,MinimumSize=new Size(90,38)};exit.Click+=delegate{context.ExitThread();};buttons.Controls.Add(exit);
             desktop.Checked=Settings.Current.Desktop;alt.Checked=Settings.Current.AltTab;tray.Checked=Settings.Current.Tray;width.Value=Settings.Current.TrayWidth;
-            move.Checked=Settings.Current.MoveOnSwitch;transparent.Checked=Settings.Current.TransparentTray;quality.SelectedIndex=Settings.Current.ImageQuality;
+            move.Checked=Settings.Current.MoveOnSwitch;transparent.Checked=Settings.Current.TransparentTray;quality.SelectedIndex=Settings.Current.ImageQuality;highResponse.Checked=Settings.Current.HighResponse;
             Shown+=delegate{Rectangle area=Screen.FromControl(this).WorkingArea;Size=new Size(Math.Min(Width,area.Width-24),Math.Min(Height,area.Height-24));};
             Disposed+=delegate{help.Dispose();};
             FormClosing+=delegate(object s,FormClosingEventArgs e){if(e.CloseReason==CloseReason.UserClosing){e.Cancel=true;Hide();}};
             RefreshStatus();
         }
-        private static void AddRow(TableLayoutPanel panel,Control control){int row=panel.RowCount++;panel.RowStyles.Add(new RowStyle(SizeType.AutoSize));control.Margin=new Padding(0,6,0,6);if(control is CheckBox){control.AutoSize=true;control.Dock=DockStyle.Fill;}panel.Controls.Add(control,0,row);}
+        private static void AddRow(TableLayoutPanel panel,Control control)
+        {
+            int row=panel.RowCount++;panel.RowStyles.Add(new RowStyle(SizeType.AutoSize));control.Margin=new Padding(0,6,0,6);
+            if(control is CheckBox){control.AutoSize=true;control.Dock=DockStyle.Fill;}
+            panel.Controls.Add(control,0,row);
+        }
         internal void RefreshStatus()
         {
             screens.Items.Clear();int index=0,selected=-1;Screen target=Settings.TargetScreen();

@@ -29,7 +29,7 @@ namespace ScreenCompanion
             StartPosition=FormStartPosition.Manual;TopMost=true;BackColor=Color.FromArgb(27,31,39);
             ForeColor=Color.White;Font=new Font("Microsoft YaHei UI",10);DoubleBuffered=true;
             AutoScaleMode=AutoScaleMode.None;
-            activateTimer.Interval=90;activateTimer.Tick+=delegate
+            activateTimer.Interval=ResponsePolicy.WindowActivation;activateTimer.Tick+=delegate
             {
                 activateTimer.Stop();WindowEntry target=pending;pending=null;activating=false;
                 if(keyboardMove)
@@ -47,7 +47,7 @@ namespace ScreenCompanion
                     else if(Settings.Current.MoveOnSwitch && !Native.MoveToScreen(target.Handle,Settings.TargetScreen()))ShowMoveFailure();
                 }
             };
-            guardTimer.Interval=100;guardTimer.Tick+=delegate
+            guardTimer.Interval=ResponsePolicy.WindowGuard;guardTimer.Tick+=delegate
             {
                 if(sequence && !pinned && !Native.KeyPressed(0x12)){sequence=false;Dismiss();}
                 if(Visible) { bool changed=false;foreach(Card c in cards){string title=c.Window.Valid?c.Window.ReadTitle():"窗口已关闭";if(title!=c.Window.Title){c.Window.Title=title;changed=true;}}if(changed)Invalidate(); }
@@ -74,7 +74,7 @@ namespace ScreenCompanion
                     Queue(delegate {if(!activating && Native.KeyPressed(0x12)){sequence=true;Advance(fresh,reverse);}});
                 }
                 else if(up && (d.Key==0x12 || d.Key==0xA4 || d.Key==0xA5))
-                {bool completed=hookSequence;hookSequence=false;Queue(delegate{sequence=false;if(!pinned){Dismiss();if(completed && !activating && Settings.Current.MoveOnSwitch){keyboardMove=true;keyboardAttempts=0;activateTimer.Start();}}});}
+                {bool completed=hookSequence;hookSequence=false;Queue(delegate{sequence=false;if(!pinned){Dismiss();if(completed && !activating && Settings.Current.MoveOnSwitch){keyboardMove=true;keyboardAttempts=0;activateTimer.Interval=90;activateTimer.Start();}}});}
                 else if(down && d.Key==27){hookSequence=false;Queue(delegate{sequence=false;if(keyboardMove){keyboardMove=false;activateTimer.Stop();}Dismiss();});}
         }
         private void Queue(Action a){try{if(!IsDisposed)BeginInvoke(a);}catch{}}
@@ -104,7 +104,6 @@ namespace ScreenCompanion
         }
         private void LayoutCards()
         {
-            foreach(Card c in cards)if(c.Thumbnail!=IntPtr.Zero){Native.DwmUnregisterThumbnail(c.Thumbnail);c.Thumbnail=IntPtr.Zero;}
             int columns=Math.Max(1,Math.Min(4,ClientSize.Width/270));int gap=14;
             int cardWidth=(ClientSize.Width-gap*(columns+1))/columns;
             int rows=Math.Max(1,(Math.Min(pageSize,cards.Count-page*pageSize)+columns-1)/columns);
@@ -112,14 +111,15 @@ namespace ScreenCompanion
             for(int i=0;i<cards.Count;i++)
             {
                 Card c=cards[i];c.Bounds=Rectangle.Empty;c.Image=Rectangle.Empty;c.Close=Rectangle.Empty;
-                if(i<page*pageSize || i>=(page+1)*pageSize)continue;
+                if(i<page*pageSize || i>=(page+1)*pageSize || !c.Window.Valid)
+                {if(c.Thumbnail!=IntPtr.Zero){Native.DwmUnregisterThumbnail(c.Thumbnail);c.Thumbnail=IntPtr.Zero;}continue;}
                 int slot=i-page*pageSize;
                 c.Bounds=new Rectangle(gap+(slot%columns)*(cardWidth+gap),62+(slot/columns)*(cardHeight+gap),cardWidth,cardHeight);
                 c.Image=new Rectangle(c.Bounds.X+7,c.Bounds.Y+38,Math.Max(1,cardWidth-14),Math.Max(1,cardHeight-46));
                 c.Close=new Rectangle(c.Bounds.Right-31,c.Bounds.Top+6,24,24);
                 if(!c.Window.Valid)continue;
-                IntPtr thumb;
-                if(Native.DwmRegisterThumbnail(Handle,c.Window.Handle,out thumb)==0)
+                IntPtr thumb=c.Thumbnail;
+                if(thumb!=IntPtr.Zero || Native.DwmRegisterThumbnail(Handle,c.Window.Handle,out thumb)==0)
                 {
                     c.Thumbnail=thumb;Size source;Rectangle destination=c.Image;
                     if(Native.DwmQueryThumbnailSourceSize(thumb,out source)==0 && source.Width>0 && source.Height>0)
@@ -170,7 +170,7 @@ namespace ScreenCompanion
         }
         internal void ActivateCard(WindowEntry w)
         {
-            pending=w;keyboardMove=false;activating=true;pinned=false;sequence=false;Dismiss();Native.ReleaseAlt();activateTimer.Start();
+            pending=w;keyboardMove=false;activating=true;pinned=false;sequence=false;Dismiss();Native.ReleaseAlt();activateTimer.Interval=ResponsePolicy.WindowActivation;activateTimer.Start();
         }
         private static void ShowMoveFailure(){MessageBox.Show("此窗口未能移到副屏。请确认副屏仍已连接；管理员窗口需要以相同权限运行副屏助手。","无法移动窗口");}
         private void Dismiss(){guardTimer.Stop();Hide();ClearCards();}

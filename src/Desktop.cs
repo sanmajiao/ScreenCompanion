@@ -23,8 +23,7 @@ namespace DesktopPortal
         private DateTime desktopDirectoryStamp;
         private FileSystemWatcher watcher;
         private FileSystemWatcher commonWatcher;
-        private LowLevelMouseProc mouseProc;
-        private IntPtr mouseHook = IntPtr.Zero;
+        private ScreenCompanion.MouseListener mouseListener;
 
         public DesktopLayerForm()
         {
@@ -45,9 +44,9 @@ namespace DesktopPortal
             canvas.InteractiveRegionChanged += delegate { ApplyInteractiveRegion(); };
             Controls.Add(canvas);
 
-            refreshTimer.Interval = 350;
+            refreshTimer.Interval = ScreenCompanion.ResponsePolicy.DesktopRefresh;
             refreshTimer.Tick += delegate { refreshTimer.Stop(); RefreshDesktopItems(); };
-            directoryHeartbeat.Interval = 2000;
+            directoryHeartbeat.Interval = ScreenCompanion.ResponsePolicy.DesktopHeartbeat;
             directoryHeartbeat.Tick += delegate { CheckDesktopDirectory(); };
 
             Shown += delegate
@@ -69,7 +68,7 @@ namespace DesktopPortal
                 refreshTimer.Dispose();
                 directoryHeartbeat.Dispose();
                 directoryHeartbeat.Stop();
-                if (mouseHook != IntPtr.Zero) UnhookWindowsHookEx(mouseHook);
+                if (mouseListener != null) mouseListener.Dispose();
                 launchMenu.Dispose();
                 canvas.DisposeItems();
             };
@@ -171,25 +170,15 @@ namespace DesktopPortal
 
         private void StartMouseHook()
         {
-            mouseProc = MouseHookCallback;
-            mouseHook = SetWindowsHookEx(WH_MOUSE_LL, mouseProc, GetModuleHandle(null), 0);
-        }
-
-        private IntPtr MouseHookCallback(int code, IntPtr wParam, IntPtr lParam)
-        {
-            if (code >= 0 && wParam == new IntPtr(WM_LBUTTONDOWN))
+            mouseListener = new ScreenCompanion.MouseListener(delegate(Point screenPoint)
             {
-                MSLLHOOKSTRUCT data = (MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(MSLLHOOKSTRUCT));
-                IntPtr target = WindowFromPoint(data.Point);
-                Point screenPoint = new Point(data.Point.X, data.Point.Y);
-                bool belongsToLayer = target == Handle || IsChild(Handle, target);
-                if (!belongsToLayer || !canvas.IsItemAtScreenPoint(screenPoint))
+                try { BeginInvoke((MethodInvoker)delegate
                 {
-                    try { BeginInvoke((MethodInvoker)delegate { canvas.ClearSelection(); }); }
-                    catch { }
-                }
-            }
-            return CallNextHookEx(mouseHook, code, wParam, lParam);
+                    if(IsDisposed)return;
+                    IntPtr target=ScreenCompanion.Native.WindowFromPoint(screenPoint);
+                    if ((target != Handle && !IsChild(Handle,target)) || !canvas.IsItemAtScreenPoint(screenPoint))canvas.ClearSelection();
+                }); } catch { }
+            });
         }
 
         private void AttachAndPlace()
@@ -286,7 +275,9 @@ namespace DesktopPortal
         private readonly Font itemFont = new Font("Microsoft YaHei UI", 9F);
         private readonly StringFormat textFormat = new StringFormat();
         private readonly BlockingCollection<Action> imageJobs = new BlockingCollection<Action>();
+        private readonly DesktopImageCache recentImages = new DesktopImageCache(ScreenCompanion.ResponsePolicy.ImageCacheLimit);
         private volatile int imageGeneration;
+        private bool resourcesDisposed;
         private DesktopItem hovered, selected;
         private DesktopItem dragItem;
         private Point dragStart, dragOrigin;
@@ -378,6 +369,12 @@ namespace DesktopPortal
 
         private void QueueImage(DesktopItem item, int generation, int pixels)
         {
+            string key=null;
+            if(ScreenCompanion.ResponsePolicy.High)
+            {
+                try { var info=new FileInfo(item.Path);key=item.Path+"|"+pixels+"|"+File.GetLastWriteTimeUtc(item.Path).Ticks+"|"+(info.Exists?info.Length:0); } catch { }
+                if(key!=null){Bitmap cached=recentImages.Get(key);if(cached!=null){item.Image=cached;return;}}
+            }
             imageJobs.Add(delegate
             {
                 if (generation != imageGeneration) return;
@@ -387,6 +384,7 @@ namespace DesktopPortal
                 try { BeginInvoke((MethodInvoker)delegate
                 {
                     if (generation != imageGeneration || IsDisposed) { image.Dispose(); return; }
+                    if(key!=null)recentImages.Put(key,image);
                     if (item.Image != null) item.Image.Dispose();
                     item.Image = image;
                     Invalidate(item.Bounds);
@@ -399,7 +397,7 @@ namespace DesktopPortal
 
         protected override void Dispose(bool disposing)
         {
-            if (disposing) { DisposeItems(); imageJobs.CompleteAdding(); itemMenu.Dispose(); itemFont.Dispose(); textFormat.Dispose(); }
+            if (disposing && !resourcesDisposed) { resourcesDisposed=true; DisposeItems(); recentImages.Dispose(); imageJobs.CompleteAdding(); itemMenu.Dispose(); itemFont.Dispose(); textFormat.Dispose(); }
             base.Dispose(disposing);
         }
 

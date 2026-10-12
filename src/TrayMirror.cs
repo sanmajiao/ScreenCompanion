@@ -46,6 +46,7 @@ namespace ScreenCompanion
         private IntPtr taskbarHost;
         private int lastFrame;
         private Bitmap lastTrayFrame;
+        private readonly TrayPixelBuffer pixels=new TrayPixelBuffer();
         private int lastClockSecond=-1;
         internal TrayMirrorForm(Action settings)
         {
@@ -56,7 +57,7 @@ namespace ScreenCompanion
             var menu=new ContextMenuStrip();menu.Items.Add("打开副屏助手设置",null,delegate{settings();});menu.Items.Add("刷新托盘画面",null,delegate{CaptureTray();});gear.ContextMenuStrip=menu;gear.Click+=delegate{settings();};
             var tip=new ToolTip();tip.SetToolTip(gear,"副屏助手设置");tip.SetToolTip(picture,"真实系统托盘 · 支持左键、右键和双击\n箭头在副屏展开真实隐藏图标菜单，菜单图标可直接操作。\n主屏隐藏时保留图标画面，点击会先展开真实托盘。");
             picture.MouseUp+=Forward;
-            timer.Interval=32;timer.Tick+=delegate{if(!forwarding)CaptureTray();};
+            timer.Interval=ResponsePolicy.TrayPoll;timer.Tick+=delegate{if(!forwarding)CaptureTray();};
             cursorTimer.Interval=200;cursorTimer.Tick+=delegate{cursorTimer.Stop();if(!clickDelivered)CaptureTray();if(forwarding){if(Cursor.Position==LastClickPoint || Cursor.Position==revealPoint)Native.SetCursorPos(returnCursor.X,returnCursor.Y);forwarding=false;capturePausedUntil=Environment.TickCount+450;}clickDelivered=false;};
             popupTimer.Interval=16;popupTimer.Tick+=delegate{TrackOverflow();};
             revealTimer.Interval=16;revealTimer.Tick+=delegate
@@ -91,7 +92,7 @@ namespace ScreenCompanion
                 else if(++revealAttempts>=75){revealTimer.Stop();pendingClick=false;Text="托盘未能展开，点击重试";cursorTimer.Start();}
             };
             Shown+=delegate{InstallPopupHooks();CaptureTray();timer.Start();};
-            FormClosing+=delegate{timer.Stop();cursorTimer.Stop();revealTimer.Stop();popupTimer.Stop();RestoreOverflow();StopPopupHooks();flyouts.Dispose();timer.Dispose();cursorTimer.Dispose();revealTimer.Dispose();popupTimer.Dispose();if(forwarding)Native.SetCursorPos(returnCursor.X,returnCursor.Y);if(picture.Image!=null){picture.Image.Dispose();picture.Image=null;}if(lastTrayFrame!=null)lastTrayFrame.Dispose();tip.Dispose();};
+            FormClosing+=delegate{timer.Stop();cursorTimer.Stop();revealTimer.Stop();popupTimer.Stop();RestoreOverflow();StopPopupHooks();flyouts.Dispose();pixels.Dispose();timer.Dispose();cursorTimer.Dispose();revealTimer.Dispose();popupTimer.Dispose();if(forwarding)Native.SetCursorPos(returnCursor.X,returnCursor.Y);if(picture.Image!=null){picture.Image.Dispose();picture.Image=null;}if(lastTrayFrame!=null)lastTrayFrame.Dispose();tip.Dispose();};
         }
         protected override bool ShowWithoutActivation{get{return true;}}
         protected override CreateParams CreateParams{get{var p=base.CreateParams;p.ExStyle|=0x80|0x08000000|0x80000;return p;}}
@@ -128,6 +129,7 @@ namespace ScreenCompanion
             int h=bar.Height;
             double scale=Math.Min(h/(double)source.Height,maxWidth/(double)source.Width);int w=Math.Max(40,(int)(source.Width*scale));
             Place(target,bar,w+30,h);
+            if(!Visible)return;
             if(!SourceVisible(source))
             {
                 Text="主屏已隐藏；保留上次托盘画面，点击展开操作";
@@ -135,7 +137,7 @@ namespace ScreenCompanion
                 else if(Visible)RefreshHiddenClock();
                 return;
             }
-            if(Environment.TickCount-capturePausedUntil<0 || (Environment.TickCount-lastFrame<120 && picture.Image!=null))return;
+            if(Environment.TickCount-capturePausedUntil<0 || (Environment.TickCount-lastFrame<ResponsePolicy.TrayFrame && picture.Image!=null))return;
             lastFrame=Environment.TickCount;Text="副屏真实托盘";
             Bitmap image=null;
             try
@@ -173,7 +175,7 @@ namespace ScreenCompanion
         }
         private void SetImage(Bitmap b)
         {
-            if(Settings.Current.TransparentTray){Bitmap transparent=TraySurface.SeparateBackground(b);b.Dispose();b=transparent;}
+            if(Settings.Current.TransparentTray){Bitmap transparent=TraySurface.SeparateBackground(b,ResponsePolicy.High?pixels:null);b.Dispose();b=transparent;}
             Image old=picture.Image;picture.Image=b;if(old!=null)old.Dispose();RenderSurface();
         }
         private void RenderSurface()
@@ -287,7 +289,7 @@ namespace ScreenCompanion
             {
                 LastPopupLatency=Environment.TickCount-clickStarted;openingOverflow=false;
                 // Track DPI adjustment briefly; native popup handles all icon input.
-                popupTimer.Interval=50;
+                popupTimer.Interval=ResponsePolicy.PopupTracking;
             }
         }
         private void RestoreOverflow()

@@ -20,7 +20,7 @@ namespace ScreenCompanion
         private bool disposed,observed;
         internal StartMenuController(Control owner)
         {
-            dispatcher=owner;timer.Interval=25;timer.Tick+=delegate{Track();};
+            dispatcher=owner;timer.Interval=ResponsePolicy.StartDiscovery;timer.Tick+=delegate{Track();};
             keyboard=new KeyboardListener(delegate(Native.KeyboardData key,bool down,bool up)
             {
                 bool tap=gesture.Update(key.Key,down,up);
@@ -49,8 +49,8 @@ namespace ScreenCompanion
         }
         private void Begin()
         {
-            if(disposed)return;
-            started=Environment.TickCount;observed=false;timer.Interval=25;timer.Start();
+            if(disposed || Settings.TargetScreen()==null)return;
+            started=Environment.TickCount;observed=false;timer.Interval=ResponsePolicy.StartDiscovery;Track();if(!disposed && (observed || Environment.TickCount-started<2000))timer.Start();
         }
         internal static IntPtr FindStartWindow()
         {
@@ -103,7 +103,7 @@ namespace ScreenCompanion
             Rectangle desired=canvas?new Rectangle(screen.Left,screen.Top,screen.Width,screen.Height-barHeight):
                 new Rectangle(screen.Left+(screen.Width-width)/2,screen.Bottom-barHeight-height-4,width,height);
             if(Native.Bounds(menu)!=desired)Native.SetWindowPos(menu,IntPtr.Zero,desired.X,desired.Y,desired.Width,desired.Height,4|16);
-            timer.Interval=50;
+            timer.Interval=ResponsePolicy.PopupTracking;
         }
         private void RestoreBar()
         {

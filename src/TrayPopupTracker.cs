@@ -89,7 +89,7 @@ namespace ScreenCompanion
                 if(Place(found,target,r,dpi))
                 {
                     original=r;originalDpi=dpi;
-                    relocated.Add(found);current=found;LastMoved=found;LastLatency=Environment.TickCount-started;timer.Interval=50;
+                    relocated.Add(found);current=found;LastMoved=found;LastLatency=Environment.TickCount-started;timer.Interval=ResponsePolicy.PopupTracking;
                 }
             }
             if(Environment.TickCount-started>2500 && (current==IntPtr.Zero || !Exposed(current)))timer.Stop();
