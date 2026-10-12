@@ -15,6 +15,7 @@ namespace ScreenCompanion
         public string ScreenName="";
         public bool Desktop=true, AltTab=true, Tray=true;
         public bool MoveOnSwitch=false,TransparentTray=true,HighResponse=false;
+        public bool WallpaperAwareTray=true;
         public int ImageQuality=1;
         public int TrayWidth=520;
         public static readonly string DataDirectory=GetDataDirectory();
@@ -28,10 +29,10 @@ namespace ScreenCompanion
         public static Settings Load()
         {
             var s=new Settings();
-            try { foreach(string line in File.ReadAllLines(FileName,Encoding.UTF8)) { int pos=line.IndexOf('='); if(pos<0)continue; string k=line.Substring(0,pos),v=line.Substring(pos+1); switch(k) { case "screen":s.ScreenName=v;break;case "highResponse":s.HighResponse=v=="1";break;case "desktop":s.Desktop=v!="0";break;case "alttab":s.AltTab=v!="0";break;case "tray":s.Tray=v!="0";break;case "moveOnSwitch":s.MoveOnSwitch=v=="1";break;case "transparentTray":s.TransparentTray=v!="0";break;case "imageQuality":int q;if(Int32.TryParse(v,out q))s.ImageQuality=Math.Max(0,Math.Min(2,q));break;case "trayWidth":int n;if(Int32.TryParse(v,out n))s.TrayWidth=Math.Max(220,Math.Min(1200,n));break; } } } catch { }
+            try { foreach(string line in File.ReadAllLines(FileName,Encoding.UTF8)) { int pos=line.IndexOf('='); if(pos<0)continue; string k=line.Substring(0,pos),v=line.Substring(pos+1); switch(k) { case "screen":s.ScreenName=v;break;case "wallpaperAwareTray":s.WallpaperAwareTray=v!="0";break;case "highResponse":s.HighResponse=v=="1";break;case "desktop":s.Desktop=v!="0";break;case "alttab":s.AltTab=v!="0";break;case "tray":s.Tray=v!="0";break;case "moveOnSwitch":s.MoveOnSwitch=v=="1";break;case "transparentTray":s.TransparentTray=v!="0";break;case "imageQuality":int q;if(Int32.TryParse(v,out q))s.ImageQuality=Math.Max(0,Math.Min(2,q));break;case "trayWidth":int n;if(Int32.TryParse(v,out n))s.TrayWidth=Math.Max(220,Math.Min(1200,n));break; } } } catch { }
             return s;
         }
-        public void Save() { File.WriteAllLines(FileName,new[]{"screen="+ScreenName,"highResponse="+(HighResponse?1:0),"desktop="+(Desktop?1:0),"alttab="+(AltTab?1:0),"tray="+(Tray?1:0),"trayWidth="+TrayWidth,"moveOnSwitch="+(MoveOnSwitch?1:0),"transparentTray="+(TransparentTray?1:0),"imageQuality="+ImageQuality},Encoding.UTF8); }
+        public void Save() { File.WriteAllLines(FileName,new[]{"screen="+ScreenName,"wallpaperAwareTray="+(WallpaperAwareTray?1:0),"highResponse="+(HighResponse?1:0),"desktop="+(Desktop?1:0),"alttab="+(AltTab?1:0),"tray="+(Tray?1:0),"trayWidth="+TrayWidth,"moveOnSwitch="+(MoveOnSwitch?1:0),"transparentTray="+(TransparentTray?1:0),"imageQuality="+ImageQuality},Encoding.UTF8); }
         internal static Settings Current;
         internal static Screen TargetScreen()
         {
@@ -157,7 +158,7 @@ namespace ScreenCompanion
     {
         private readonly CompanionContext context;
         private readonly ComboBox screens=new ComboBox();
-        private readonly CheckBox desktop=new CheckBox(),alt=new CheckBox(),tray=new CheckBox(),move=new CheckBox(),transparent=new CheckBox(),highResponse=new CheckBox();
+        private readonly CheckBox desktop=new CheckBox(),alt=new CheckBox(),tray=new CheckBox(),move=new CheckBox(),transparent=new CheckBox(),highResponse=new CheckBox(),wallpaperAware=new CheckBox();
         private readonly ComboBox quality=new ComboBox();
         private readonly ToolTip help=new ToolTip();
         private readonly NumericUpDown width=new NumericUpDown();
@@ -165,7 +166,7 @@ namespace ScreenCompanion
         internal SettingsForm(CompanionContext ctx)
         {
             context=ctx;Text="副屏助手";Icon=AppIcon.Create();Font=new Font("Microsoft YaHei UI",10);
-            AutoScaleDimensions=new SizeF(96,96);AutoScaleMode=AutoScaleMode.Dpi;ClientSize=new Size(680,620);MinimumSize=new Size(560,420);StartPosition=FormStartPosition.CenterScreen;AutoScroll=true;
+            AutoScaleDimensions=new SizeF(96,96);AutoScaleMode=AutoScaleMode.Dpi;ClientSize=new Size(680,700);MinimumSize=new Size(560,420);StartPosition=FormStartPosition.CenterScreen;AutoScroll=true;
             BackColor=Color.FromArgb(246,248,252);
             var layout=new TableLayoutPanel{Dock=DockStyle.Top,AutoSize=true,ColumnCount=1,Padding=new Padding(24),GrowStyle=TableLayoutPanelGrowStyle.AddRows};layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent,100));Controls.Add(layout);
             AddRow(layout,new Label{Text="一个入口，管理你的副屏",Font=new Font(Font.FontFamily,19,FontStyle.Bold),AutoSize=true});
@@ -181,6 +182,8 @@ namespace ScreenCompanion
             move.Text="切换时将选中的窗口直接移到目标副屏";AddRow(layout,move);help.SetToolTip(move,"勾选后，点击卡片或按 Alt+Tab 后松开 Alt，会把实际选中的窗口移到上方选择的副屏。\n保留最大化状态；取消勾选后只切换窗口。");
             tray.Text="托盘镜像：图标、网络、音量、电池与时钟";AddRow(layout,tray);
             transparent.Text="托盘背景透明，使用副屏自己的背景";AddRow(layout,transparent);
+            wallpaperAware.Text="兼容透明任务栏（TranslucentTB）：去除主屏壁纸纹理";AddRow(layout,wallpaperAware);
+            help.SetToolTip(wallpaperAware,"默认开启。按主屏实际壁纸及填充方式生成参考背景，再分离图标，避免清晰壁纸混入副屏。\n只在截图边缘与参考背景匹配时使用；不修改 TranslucentTB 或系统配置。\n桌面壁纸参考在后台加载，保留的托盘裁剪缓存最多 1 MiB；不是整屏缓存。\n动态壁纸、HDR 色彩差异或应用覆盖背景可能无法匹配；关闭后恢复原来的估算方式。");
             help.SetToolTip(transparent,"从截图中分离背景，图标叠加到副屏任务栏；时钟使用副屏原生时钟，避免重影。\n复杂背景可能残留边缘；取消勾选可恢复完整原始镜像。");
             var images=new FlowLayoutPanel{AutoSize=true,Dock=DockStyle.Fill};images.Controls.Add(new Label{Text="图标 / 图片清晰度",AutoSize=true,Margin=new Padding(0,7,12,0)});
             quality.DropDownStyle=ComboBoxStyle.DropDownList;quality.Width=290;quality.Items.AddRange(new object[]{"低 · 32 像素 · 约 0.4 MiB / 100 项","中 · 64 像素 · 约 1.6 MiB / 100 项","高 · 128 像素 · 约 6.3 MiB / 100 项"});images.Controls.Add(quality);
@@ -194,14 +197,14 @@ namespace ScreenCompanion
             {
                 if(screens.SelectedItem is ScreenChoice)Settings.Current.ScreenName=((ScreenChoice)screens.SelectedItem).Device;
                 Settings.Current.Desktop=desktop.Checked;Settings.Current.AltTab=alt.Checked;Settings.Current.Tray=tray.Checked;Settings.Current.TrayWidth=(int)width.Value;
-                Settings.Current.MoveOnSwitch=move.Checked;Settings.Current.TransparentTray=transparent.Checked;Settings.Current.ImageQuality=Math.Max(0,quality.SelectedIndex);Settings.Current.HighResponse=highResponse.Checked;
+                Settings.Current.MoveOnSwitch=move.Checked;Settings.Current.TransparentTray=transparent.Checked;Settings.Current.ImageQuality=Math.Max(0,quality.SelectedIndex);Settings.Current.HighResponse=highResponse.Checked;Settings.Current.WallpaperAwareTray=wallpaperAware.Checked;
                 try { Settings.Current.Save();context.Apply();status.Text="设置已保存。关闭这个窗口后，副屏功能继续运行。"; }
                 catch(Exception e) { MessageBox.Show("设置未能保存："+e.Message,"副屏助手"); }
             };
             var hide=new Button{Text="收起到托盘",AutoSize=true,MinimumSize=new Size(120,38)};hide.Click+=delegate{Hide();};buttons.Controls.Add(hide);
             var exit=new Button{Text="退出",AutoSize=true,MinimumSize=new Size(90,38)};exit.Click+=delegate{context.ExitThread();};buttons.Controls.Add(exit);
             desktop.Checked=Settings.Current.Desktop;alt.Checked=Settings.Current.AltTab;tray.Checked=Settings.Current.Tray;width.Value=Settings.Current.TrayWidth;
-            move.Checked=Settings.Current.MoveOnSwitch;transparent.Checked=Settings.Current.TransparentTray;quality.SelectedIndex=Settings.Current.ImageQuality;highResponse.Checked=Settings.Current.HighResponse;
+            move.Checked=Settings.Current.MoveOnSwitch;transparent.Checked=Settings.Current.TransparentTray;quality.SelectedIndex=Settings.Current.ImageQuality;highResponse.Checked=Settings.Current.HighResponse;wallpaperAware.Checked=Settings.Current.WallpaperAwareTray;
             Shown+=delegate{Rectangle area=Screen.FromControl(this).WorkingArea;Size=new Size(Math.Min(Width,area.Width-24),Math.Min(Height,area.Height-24));};
             Disposed+=delegate{help.Dispose();};
             FormClosing+=delegate(object s,FormClosingEventArgs e){if(e.CloseReason==CloseReason.UserClosing){e.Cancel=true;Hide();}};

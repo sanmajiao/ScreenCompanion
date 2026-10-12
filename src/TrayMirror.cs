@@ -46,6 +46,8 @@ namespace ScreenCompanion
         private IntPtr taskbarHost;
         private int lastFrame;
         private Bitmap lastTrayFrame;
+        private Rectangle lastTraySource;
+        private WallpaperBackdrop wallpaper;
         private readonly TrayPixelBuffer pixels=new TrayPixelBuffer();
         private int lastClockSecond=-1;
         internal TrayMirrorForm(Action settings)
@@ -92,7 +94,7 @@ namespace ScreenCompanion
                 else if(++revealAttempts>=75){revealTimer.Stop();pendingClick=false;Text="托盘未能展开，点击重试";cursorTimer.Start();}
             };
             Shown+=delegate{InstallPopupHooks();CaptureTray();timer.Start();};
-            FormClosing+=delegate{timer.Stop();cursorTimer.Stop();revealTimer.Stop();popupTimer.Stop();RestoreOverflow();StopPopupHooks();flyouts.Dispose();pixels.Dispose();timer.Dispose();cursorTimer.Dispose();revealTimer.Dispose();popupTimer.Dispose();if(forwarding)Native.SetCursorPos(returnCursor.X,returnCursor.Y);if(picture.Image!=null){picture.Image.Dispose();picture.Image=null;}if(lastTrayFrame!=null)lastTrayFrame.Dispose();tip.Dispose();};
+            FormClosing+=delegate{timer.Stop();cursorTimer.Stop();revealTimer.Stop();popupTimer.Stop();RestoreOverflow();StopPopupHooks();flyouts.Dispose();if(wallpaper!=null)wallpaper.Dispose();pixels.Dispose();timer.Dispose();cursorTimer.Dispose();revealTimer.Dispose();popupTimer.Dispose();if(forwarding)Native.SetCursorPos(returnCursor.X,returnCursor.Y);if(picture.Image!=null){picture.Image.Dispose();picture.Image=null;}if(lastTrayFrame!=null)lastTrayFrame.Dispose();tip.Dispose();};
         }
         protected override bool ShowWithoutActivation{get{return true;}}
         protected override CreateParams CreateParams{get{var p=base.CreateParams;p.ExStyle|=0x80|0x08000000|0x80000;return p;}}
@@ -145,6 +147,7 @@ namespace ScreenCompanion
                 image=new Bitmap(source.Width,source.Height,PixelFormat.Format32bppPArgb);
                 using(var g=Graphics.FromImage(image))g.CopyFromScreen(source.Location,Point.Empty,source.Size);
                 if(lastTrayFrame!=null)lastTrayFrame.Dispose();lastTrayFrame=(Bitmap)image.Clone();
+                lastTraySource=source;
                 SetImage(image);image=null;
             }
             catch { Text="副屏托盘：屏幕暂不可捕获"; }
@@ -175,7 +178,17 @@ namespace ScreenCompanion
         }
         private void SetImage(Bitmap b)
         {
-            if(Settings.Current.TransparentTray){Bitmap transparent=TraySurface.SeparateBackground(b,ResponsePolicy.High?pixels:null);b.Dispose();b=transparent;}
+            if(Settings.Current.TransparentTray)
+            {
+                Bitmap reference=null;
+                if(Settings.Current.WallpaperAwareTray && !lastTraySource.IsEmpty && lastTraySource.Size==b.Size)
+                {
+                    if(wallpaper==null)wallpaper=new WallpaperBackdrop();
+                    reference=wallpaper.Get(lastTraySource,Screen.FromRectangle(lastTraySource).Bounds,SystemInformation.VirtualScreen);
+                }
+                try{Bitmap transparent=TraySurface.SeparateBackground(b,ResponsePolicy.High?pixels:null,reference);b.Dispose();b=transparent;}
+                finally{if(reference!=null)reference.Dispose();}
+            }
             Image old=picture.Image;picture.Image=b;if(old!=null)old.Dispose();RenderSurface();
         }
         private void RenderSurface()
@@ -207,6 +220,9 @@ namespace ScreenCompanion
             // visible pixels; application icons retain the last real tray frame.
             DateTime now=DateTime.Now;if(lastTrayFrame==null || lastClockSecond==now.Second)return;lastClockSecond=now.Second;
             Bitmap frame=(Bitmap)lastTrayFrame.Clone();
+            // Transparent mode exposes the secondary native clock. Painting a
+            // synthetic primary clock would contaminate wallpaper-fit margins.
+            if(Settings.Current.TransparentTray){SetImage(frame);return;}
             int clockWidth=Math.Min(frame.Width/2,Math.Max(82,frame.Height*7/4));
             Rectangle area=new Rectangle(frame.Width-clockWidth,0,clockWidth,frame.Height);
             Color background=frame.GetPixel(frame.Width-4,Math.Min(4,frame.Height-1));

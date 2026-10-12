@@ -6,15 +6,20 @@ namespace ScreenCompanion
 {
  internal sealed class TrayPixelBuffer : IDisposable
  {
-  internal byte[] Input,Output;
-  internal long Bytes { get { return Input==null?0:(long)Input.Length+Output.Length; } }
+  internal byte[] Input,Output,Background;
+  internal long Bytes { get { return Input==null?0:(long)Input.Length+Output.Length+(Background==null?0:Background.Length); } }
   internal void Get(int size,out byte[] input,out byte[] output)
   {
    if((long)size*2>8L*1024*1024){Dispose();input=new byte[size];output=new byte[size];return;}
-   if(Input==null || Input.Length!=size){Input=new byte[size];Output=new byte[size];}
+   if(Input==null || Input.Length!=size){Input=new byte[size];Output=new byte[size];Background=null;}
    input=Input;output=Output;
   }
-  public void Dispose(){Input=Output=null;}
+  internal byte[] GetBackground(int size)
+  {
+   if((long)size*3>8L*1024*1024){Background=null;return new byte[size];}
+   if(Background==null || Background.Length!=size)Background=new byte[size];return Background;
+  }
+  public void Dispose(){Input=Output=Background=null;}
  }
  internal static class TraySurface
  {
@@ -23,6 +28,8 @@ namespace ScreenCompanion
   internal static Bitmap SeparateBackground(Bitmap source)
   {return SeparateBackground(source,null);}
   internal static Bitmap SeparateBackground(Bitmap source,TrayPixelBuffer buffer)
+  {return SeparateBackground(source,buffer,null);}
+  internal static Bitmap SeparateBackground(Bitmap source,TrayPixelBuffer buffer,Bitmap wallpaper)
   {
    var result=new Bitmap(source.Width,source.Height,PixelFormat.Format32bppPArgb);
    var rect=new Rectangle(Point.Empty,source.Size);
@@ -33,6 +40,14 @@ namespace ScreenCompanion
    try
    {
     for(int y=0;y<source.Height;y++)Marshal.Copy(IntPtr.Add(read.Scan0,y*read.Stride),input,y*source.Width*4,source.Width*4);
+    byte[] reference=null;WallpaperMatting model=null;
+    if(wallpaper!=null && wallpaper.Size==source.Size)
+    {
+     reference=buffer==null?new byte[length]:buffer.GetBackground(length);
+     var data=wallpaper.LockBits(rect,ImageLockMode.ReadOnly,PixelFormat.Format32bppPArgb);
+     try{for(int y=0;y<source.Height;y++)Marshal.Copy(IntPtr.Add(data.Scan0,y*data.Stride),reference,y*source.Width*4,source.Width*4);}finally{wallpaper.UnlockBits(data);}
+     model=WallpaperMatting.Fit(input,reference,source.Width,source.Height);
+    }
     // Only three tiny arrays per frame, rather than one array for every pixel.
     double[] top=new double[3],bottom=new double[3],background=new double[3];
     for(int x=0;x<source.Width;x++)
@@ -44,7 +59,7 @@ namespace ScreenCompanion
      for(int y=0;y<source.Height;y++)
      {
       int i=(y*source.Width+x)*4;double t=Math.Max(0,Math.Min(1,(y-3.0)/Math.Max(1,source.Height-7))),alpha=0,diff=0;
-      for(int c=0;c<3;c++){double b=(top[c]*(1-t)+bottom[c]*t)/count; background[c]=b;double d=input[i+c]-b;diff=Math.Max(diff,Math.Abs(d));alpha=Math.Max(alpha,d>=0?d/Math.Max(1,255-b):-d/Math.Max(1,b));}
+      for(int c=0;c<3;c++){double b=model==null?(top[c]*(1-t)+bottom[c]*t)/count:model.Color(reference[i+c],c); background[c]=b;double d=input[i+c]-b;diff=Math.Max(diff,Math.Abs(d));alpha=Math.Max(alpha,d>=0?d/Math.Max(1,255-b):-d/Math.Max(1,b));}
       if(diff<9)alpha=0;alpha=Math.Min(1,Math.Max(0,alpha));byte a=(byte)Math.Round(alpha*255);output[i+3]=a;
       for(int c=0;c<3;c++)output[i+c]=(byte)Math.Max(0,Math.Min(a,input[i+c]-(1-alpha)*background[c]));
      }

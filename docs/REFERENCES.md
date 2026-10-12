@@ -13,5 +13,9 @@
 - [IShellItemImageFactory](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nn-shobjidl_core-ishellitemimagefactory)
 - [UpdateLayeredWindow](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-updatelayeredwindow)
 - [SetWindowPos](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowpos)
+- [IDesktopWallpaper](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nn-shobjidl_core-idesktopwallpaper)
+- [DESKTOP_WALLPAPER_POSITION](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/ne-shobjidl_core-desktop_wallpaper_position)
+
+透明任务栏兼容参考 [TranslucentTB 配置说明](https://translucenttb.github.io/config.html) 中的透明与带色背景模式；未包含其代码或修改其配置。
 
 第三方项目的许可由其作者维护；以上信息是调查快照。本项目未安装或注入 Windhawk，也未复用其 Explorer 注入代码。
