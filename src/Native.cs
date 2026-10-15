@@ -136,6 +136,48 @@ namespace ScreenCompanion
             a[1].Data.Mouse.Flags=down; a[2].Data.Mouse.Flags=up;
             return SendInput(3,a,Marshal.SizeOf(typeof(Input)))==3;
         }
+        // Mark our pointer transaction so restoration guards distinguish it
+        // from genuine user movement and other applications' cursor input.
+        internal static readonly IntPtr PointerInputTag=new IntPtr(0x53435051);
+        internal static Input PointerMove(Point point)
+        {
+            Rectangle desktop=SystemInformation.VirtualScreen;
+            int x=Math.Max(desktop.Left,Math.Min(desktop.Right-1,point.X));
+            int y=Math.Max(desktop.Top,Math.Min(desktop.Bottom-1,point.Y));
+            return new Input{Data=new InputUnion{Mouse=new MouseInput{
+                X=(int)Math.Round((x-desktop.Left)*65535.0/Math.Max(1,desktop.Width-1)),
+                Y=(int)Math.Round((y-desktop.Top)*65535.0/Math.Max(1,desktop.Height-1)),
+                Flags=0xC001,Extra=PointerInputTag}}};
+        }
+        internal static bool MovePointer(Point point)
+        {return SendInput(1,new[]{PointerMove(point)},Marshal.SizeOf(typeof(Input)))==1;}
+        internal static Input[] PointerClick(Point point,MouseButtons button,Point returnPoint)
+        {
+            uint down=button==MouseButtons.Right?8u:2u,up=button==MouseButtons.Right?16u:4u;
+            return new[]{PointerMove(point),
+                new Input{Data=new InputUnion{Mouse=new MouseInput{Flags=down,Extra=PointerInputTag}}},
+                new Input{Data=new InputUnion{Mouse=new MouseInput{Flags=up,Extra=PointerInputTag}}},
+                PointerMove(returnPoint)};
+        }
+        internal static bool ClickAndRestore(Point point,MouseButtons button,Point returnPoint)
+        {
+            if(button!=MouseButtons.Left && button!=MouseButtons.Right)return false;
+            var input=PointerClick(point,button,returnPoint);
+            uint sent=SendInput((uint)input.Length,input,Marshal.SizeOf(typeof(Input)));
+            if(sent==2)SendInput(1,new[]{input[2]},Marshal.SizeOf(typeof(Input)));
+            // A partial native-input insertion must not leave our moved cursor
+            // behind. Guard this fallback rather than overwriting new user input.
+            Point actual=Cursor.Position;
+            if(sent>0 && sent<input.Length && Math.Abs(actual.X-point.X)<=2 && Math.Abs(actual.Y-point.Y)<=2)MovePointer(returnPoint);
+            return sent==input.Length;
+        }
+        internal static bool ClickPreservingCursor(IntPtr expectedRoot,Rectangle expectedBounds,Point point,MouseButtons button)
+        {
+            if(expectedRoot==IntPtr.Zero || !IsWindowVisible(expectedRoot) || Bounds(expectedRoot)!=expectedBounds || !expectedBounds.Contains(point))return false;
+            int cloaked;if(DwmGetWindowAttribute(expectedRoot,14,out cloaked,4)==0 && cloaked!=0)return false;
+            if(GetAncestor(WindowFromPoint(point),2)!=expectedRoot)return false;
+            return ClickAndRestore(point,button,Cursor.Position);
+        }
     }
     internal sealed class WindowEntry
     {

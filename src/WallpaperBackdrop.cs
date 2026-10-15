@@ -49,7 +49,12 @@ namespace ScreenCompanion
             lock(sync)
             {
                 if(disposed)return null;
-                if(!pending && (cachedKey!=request.Key || Environment.TickCount-nextCheck>=0))
+                // While decoding an earlier monitor crop, retain only the most
+                // recent geometry. A topology/auto-hide change must not wait for
+                // another poll and a second stale wallpaper load.
+                if(pending)
+                {if(requested.Key!=request.Key)requested=request;}
+                else if(cachedKey!=request.Key || Environment.TickCount-nextCheck>=0)
                 {requested=request;pending=true;wake.Set();}
                 return cached!=null && cachedKey==request.Key?(Bitmap)cached.Clone():null;
             }
@@ -76,6 +81,8 @@ namespace ScreenCompanion
                     lock(sync)
                     {
                         if(disposed){if(next!=null)next.Dispose();return;}
+                        if(requested.Key!=request.Key)
+                        {if(next!=null)next.Dispose();wake.Set();continue;}
                         if(!unchanged){if(cached!=null)cached.Dispose();cached=next;stamp=nextStamp;cachedKey=request.Key;}
                         pending=false;nextCheck=Environment.TickCount+3000;
                     }

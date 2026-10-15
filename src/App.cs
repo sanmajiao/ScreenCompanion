@@ -116,7 +116,7 @@ namespace ScreenCompanion
                 startMenu=new StartMenuController(dispatcher);
                 if(Settings.Current.Desktop) { desktop=new DesktopPortal.DesktopLayerForm();desktop.Show(); }
                 if(Settings.Current.AltTab) { switcher=new SwitcherForm();switcher.Initialize(); }
-                if(Settings.Current.Tray) { trayMirror=new TrayMirrorForm(ShowSettings);trayMirror.Show(); }
+                if(Settings.Current.Tray) { trayMirror=new TrayMirrorForm(ShowSettings);trayMirror.Start(); }
             }
             if(settings!=null && !settings.IsDisposed)settings.RefreshStatus();
         }

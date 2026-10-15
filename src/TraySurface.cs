@@ -33,12 +33,15 @@ namespace ScreenCompanion
   {
    var result=new Bitmap(source.Width,source.Height,PixelFormat.Format32bppPArgb);
    var rect=new Rectangle(Point.Empty,source.Size);
-   var read=source.LockBits(rect,ImageLockMode.ReadOnly,PixelFormat.Format32bppPArgb);
-   var write=result.LockBits(rect,ImageLockMode.WriteOnly,PixelFormat.Format32bppPArgb);
-   byte[] input,output;int length=checked(source.Width*source.Height*4);
-   if(buffer==null){input=new byte[length];output=new byte[length];}else buffer.Get(length,out input,out output);
    try
    {
+    BitmapData read=null,write=null;
+    try
+    {
+    read=source.LockBits(rect,ImageLockMode.ReadOnly,PixelFormat.Format32bppPArgb);
+    write=result.LockBits(rect,ImageLockMode.WriteOnly,PixelFormat.Format32bppPArgb);
+    byte[] input,output;int length=checked(source.Width*source.Height*4);
+    if(buffer==null){input=new byte[length];output=new byte[length];}else buffer.Get(length,out input,out output);
     for(int y=0;y<source.Height;y++)Marshal.Copy(IntPtr.Add(read.Scan0,y*read.Stride),input,y*source.Width*4,source.Width*4);
     byte[] reference=null;WallpaperMatting model=null;
     if(wallpaper!=null && wallpaper.Size==source.Size)
@@ -48,7 +51,10 @@ namespace ScreenCompanion
      try{for(int y=0;y<source.Height;y++)Marshal.Copy(IntPtr.Add(data.Scan0,y*data.Stride),reference,y*source.Width*4,source.Width*4);}finally{wallpaper.UnlockBits(data);}
      model=WallpaperMatting.Fit(input,reference,source.Width,source.Height);
     }
-    // Only three tiny arrays per frame, rather than one array for every pixel.
+    // The row interpolation is identical for every column. Compute it once;
+    // keep the original arithmetic order so antialiased glyph bytes are stable.
+    var rowBlend=new double[source.Height];
+    for(int y=0;y<source.Height;y++)rowBlend[y]=Math.Max(0,Math.Min(1,(y-3.0)/Math.Max(1,source.Height-7)));
     double[] top=new double[3],bottom=new double[3],background=new double[3];
     for(int x=0;x<source.Width;x++)
     {
@@ -58,16 +64,27 @@ namespace ScreenCompanion
      if(count==0)count=1;
      for(int y=0;y<source.Height;y++)
      {
-      int i=(y*source.Width+x)*4;double t=Math.Max(0,Math.Min(1,(y-3.0)/Math.Max(1,source.Height-7))),alpha=0,diff=0;
-      for(int c=0;c<3;c++){double b=model==null?(top[c]*(1-t)+bottom[c]*t)/count:model.Color(reference[i+c],c); background[c]=b;double d=input[i+c]-b;diff=Math.Max(diff,Math.Abs(d));alpha=Math.Max(alpha,d>=0?d/Math.Max(1,255-b):-d/Math.Max(1,b));}
-      if(diff<9)alpha=0;alpha=Math.Min(1,Math.Max(0,alpha));byte a=(byte)Math.Round(alpha*255);output[i+3]=a;
-      for(int c=0;c<3;c++)output[i+c]=(byte)Math.Max(0,Math.Min(a,input[i+c]-(1-alpha)*background[c]));
+      int i=(y*source.Width+x)*4;double t=rowBlend[y],alpha=0,diff=0;
+      for(int c=0;c<3;c++)
+      {
+       double b;
+       if(model==null)b=(top[c]*(1-t)+bottom[c]*t)/count;
+       else{b=reference[i+c]*model.Scale+model.Offset[c];if(b<0)b=0;else if(b>255)b=255;}
+       background[c]=b;double d=input[i+c]-b,absolute=d<0?-d:d;if(absolute>diff)diff=absolute;
+       double denominator=d>=0?255-b:b;if(denominator<1)denominator=1;
+       double candidate=absolute/denominator;if(candidate>alpha)alpha=candidate;
+      }
+      if(diff<9)alpha=0;else if(alpha>1)alpha=1;
+      byte a=(byte)Math.Round(alpha*255);output[i+3]=a;
+      for(int c=0;c<3;c++){double value=input[i+c]-(1-alpha)*background[c];output[i+c]=(byte)(value<0?0:value>a?a:value);}
      }
     }
     for(int y=0;y<source.Height;y++)Marshal.Copy(output,y*source.Width*4,IntPtr.Add(write.Scan0,y*write.Stride),source.Width*4);
+    }
+    finally{if(read!=null)source.UnlockBits(read);if(write!=null)result.UnlockBits(write);}
+    return result;
    }
-   finally{source.UnlockBits(read);result.UnlockBits(write);}
-   return result;
+   catch{result.Dispose();throw;}
   }
   [StructLayout(LayoutKind.Sequential)]private struct Blend{internal byte Op,Flags,Alpha,Format;}
   [DllImport("user32.dll")]private static extern bool UpdateLayeredWindow(IntPtr window,IntPtr destination,ref Point position,ref Size size,IntPtr source,ref Point origin,int key,ref Blend blend,uint flags);
