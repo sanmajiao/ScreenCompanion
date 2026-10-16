@@ -16,17 +16,30 @@ namespace ScreenCompanion
         private KeyboardListener keyboard;
         private bool hookSequence;
         private bool sequence,pinned,activating;
+        private bool suppressRelease;
         private bool keyboardMove;
         private int keyboardAttempts;
         private int selected,page,pageSize=12;
         private WindowEntry pending;
+        private WindowEntry pressed;
+        private Rectangle pressedBounds;
+        private bool pressedClose;
+        private bool hasPress;
+        private int layoutVersion,pressedVersion;
+        private readonly Func<List<WindowEntry>> readWindows;
+        private readonly Func<IntPtr,bool> activateWindow;
+        private readonly Action releaseAlt;
+        private readonly Func<int,bool> keyPressed;
+        private readonly Func<IntPtr> foregroundWindow;
         private readonly Font titleFont=new Font("Microsoft YaHei UI",14,FontStyle.Bold);
         private readonly System.Windows.Forms.Timer activateTimer=new System.Windows.Forms.Timer();
         private readonly System.Windows.Forms.Timer guardTimer=new System.Windows.Forms.Timer();
-        internal SwitcherForm()
+        internal SwitcherForm():this(WindowEntry.Read,Native.Activate,Native.ReleaseAlt,Native.KeyPressed,Native.GetForegroundWindow){}
+        internal SwitcherForm(Func<List<WindowEntry>> read,Func<IntPtr,bool> activate,Action release,Func<int,bool> keys,Func<IntPtr> foregroundGetter)
         {
+            readWindows=read;activateWindow=activate;releaseAlt=release;keyPressed=keys;foregroundWindow=foregroundGetter;
             Text="副屏窗口面板";FormBorderStyle=FormBorderStyle.None;ShowInTaskbar=false;
-            StartPosition=FormStartPosition.Manual;TopMost=true;BackColor=Color.FromArgb(27,31,39);
+            StartPosition=FormStartPosition.Manual;BackColor=Color.FromArgb(27,31,39);
             ForeColor=Color.White;Font=new Font("Microsoft YaHei UI",10);DoubleBuffered=true;
             AutoScaleMode=AutoScaleMode.None;
             activateTimer.Interval=ResponsePolicy.WindowActivation;activateTimer.Tick+=delegate
@@ -34,8 +47,8 @@ namespace ScreenCompanion
                 activateTimer.Stop();WindowEntry target=pending;pending=null;activating=false;
                 if(keyboardMove)
                 {
-                    IntPtr foreground=Native.GetForegroundWindow();WindowEntry actual=null;
-                    foreach(WindowEntry entry in WindowEntry.Read())if(entry.Handle==foreground){actual=entry;break;}
+                    IntPtr foreground=foregroundWindow();WindowEntry actual=null;
+                    foreach(WindowEntry entry in readWindows())if(entry.Handle==foreground){actual=entry;break;}
                     if(actual==null && ++keyboardAttempts<8){activateTimer.Start();return;}
                     keyboardMove=false;
                     if(actual!=null && Settings.Current.MoveOnSwitch && !Native.MoveToScreen(actual.Handle,Settings.TargetScreen()))ShowMoveFailure();
@@ -43,16 +56,17 @@ namespace ScreenCompanion
                 }
                 if(target!=null && target.Valid)
                 {
-                    if(!Native.Activate(target.Handle))MessageBox.Show("Windows 未允许切换此窗口。若它以管理员身份运行，请使用相同权限启动副屏助手。","无法切换窗口");
+                    if(!activateWindow(target.Handle))MessageBox.Show("Windows 未允许切换此窗口。若它以管理员身份运行，请使用相同权限启动副屏助手。","无法切换窗口");
                     else if(Settings.Current.MoveOnSwitch && !Native.MoveToScreen(target.Handle,Settings.TargetScreen()))ShowMoveFailure();
                 }
             };
             guardTimer.Interval=ResponsePolicy.WindowGuard;guardTimer.Tick+=delegate
             {
-                if(sequence && !pinned && !Native.KeyPressed(0x12)){sequence=false;Dismiss();}
+                if(sequence && !pinned && !keyPressed(0x12))CompleteSequence(true);
                 if(Visible) { bool changed=false;foreach(Card c in cards){string title=c.Window.Valid?c.Window.ReadTitle():"窗口已关闭";if(title!=c.Window.Title){c.Window.Title=title;changed=true;}}if(changed)Invalidate(); }
             };
             MouseUp+=ClickCard;
+            MouseDown+=PressCard;
             MouseWheel+=delegate(object s,MouseEventArgs e){if(cards.Count>pageSize){page=Math.Max(0,Math.Min((cards.Count-1)/pageSize,page+(e.Delta<0?1:-1)));LayoutCards();}};
             FormClosing+=delegate
             {
@@ -61,24 +75,42 @@ namespace ScreenCompanion
             };
         }
         protected override bool ShowWithoutActivation {get{return true;}}
-        protected override CreateParams CreateParams {get{var c=base.CreateParams;c.ExStyle|=0x80|0x08000000;return c;}}
+        protected override CreateParams CreateParams {get{var c=base.CreateParams;c.ExStyle|=8|0x80|0x08000000;return c;}}
         internal void Initialize()
         {
             IntPtr h=Handle;keyboard=new KeyboardListener(ObserveKey);
         }
         private void ObserveKey(Native.KeyboardData d,bool down,bool up)
         {
-                if(down && d.Key==9 && ((d.Flags&0x20)!=0 || Native.KeyPressed(0x12)))
+                if(down && d.Key==9 && ((d.Flags&0x20)!=0 || keyPressed(0x12)))
                 {
-                    bool reverse=Native.KeyPressed(0x10);bool fresh=!hookSequence;hookSequence=true;
-                    Queue(delegate {if(!activating && Native.KeyPressed(0x12)){sequence=true;Advance(fresh,reverse);}});
+                    bool reverse=keyPressed(0x10);bool fresh=!hookSequence;hookSequence=true;
+                    Queue(delegate {if(fresh)CancelPending();if(keyPressed(0x12) && !activating){sequence=true;Advance(fresh,reverse);}});
                 }
                 else if(up && (d.Key==0x12 || d.Key==0xA4 || d.Key==0xA5))
-                {bool completed=hookSequence;hookSequence=false;Queue(delegate{sequence=false;if(!pinned){Dismiss();if(completed && !activating && Settings.Current.MoveOnSwitch){keyboardMove=true;keyboardAttempts=0;activateTimer.Interval=90;activateTimer.Start();}}});}
-                else if(down && d.Key==27){hookSequence=false;Queue(delegate{sequence=false;if(keyboardMove){keyboardMove=false;activateTimer.Stop();}Dismiss();});}
+                {bool completed=hookSequence;hookSequence=false;Queue(delegate{CompleteSequence(completed);});}
+                else if(down && d.Key==27){hookSequence=false;Queue(delegate{sequence=false;CancelPending();Dismiss();});}
         }
         private void Queue(Action a){try{if(!IsDisposed)BeginInvoke(a);}catch{}}
-        internal void OpenPinned(){pinned=true;sequence=false;LoadCards();selected=0;Present();}
+        internal void OpenPinned(){CancelPending();pinned=true;sequence=false;LoadCards();selected=0;Present();}
+        private void ClearPress(){hasPress=false;pressed=null;pressedBounds=Rectangle.Empty;}
+        private void CancelPending(){activateTimer.Stop();pending=null;keyboardMove=false;activating=false;suppressRelease=false;ClearPress();}
+        private void CompleteSequence(bool completed)
+        {
+            if(suppressRelease){sequence=false;return;}
+            // A displayed card is the selection contract. Native Alt+Tab's
+            // foreground order can differ from our HWND/title/thumbnail order.
+            WindowEntry chosen=sequence && selected>=0 && selected<cards.Count?cards[selected].Window:null;
+            if(hasPress && pressed!=null && !pressedClose)
+            {if(pressedVersion==layoutVersion)chosen=pressed;else{chosen=null;completed=false;}}
+            sequence=false;
+            if(pinned)return;
+            if(activating){Dismiss();return;} // A queued mouse choice owns its HWND.
+            if(completed && chosen!=null && chosen.Valid){Schedule(chosen,false);return;}
+            Dismiss();
+            // Fast Alt+Tab that never displayed this panel remains native.
+            if(completed && Settings.Current.MoveOnSwitch){keyboardMove=true;keyboardAttempts=0;activateTimer.Interval=90;activateTimer.Start();}
+        }
         private void Advance(bool fresh,bool reverse)
         {
             pinned=false;
@@ -88,7 +120,7 @@ namespace ScreenCompanion
         }
         private void LoadCards()
         {
-            ClearCards();foreach(WindowEntry w in WindowEntry.Read())cards.Add(new Card{Window=w});page=0;
+            ClearCards();foreach(WindowEntry w in readWindows())cards.Add(new Card{Window=w});page=0;
         }
         private void Present()
         {
@@ -104,6 +136,7 @@ namespace ScreenCompanion
         }
         private void LayoutCards()
         {
+            layoutVersion++;
             int columns=Math.Max(1,Math.Min(4,ClientSize.Width/270));int gap=14;
             int cardWidth=(ClientSize.Width-gap*(columns+1))/columns;
             int rows=Math.Max(1,(Math.Min(pageSize,cards.Count-page*pageSize)+columns-1)/columns);
@@ -154,26 +187,42 @@ namespace ScreenCompanion
         private void ClickCard(object sender,MouseEventArgs e)
         {
             if(e.Button!=MouseButtons.Left)return;
-            if(new Rectangle(Width-40,10,40,40).Contains(e.Location)){pinned=false;Dismiss();return;}
+            if(new Rectangle(Width-40,10,40,40).Contains(e.Location)){CancelPending();pinned=false;Dismiss();return;}
+            WindowEntry chosen=pressed;Rectangle bounds=pressedBounds;bool close=pressedClose;
+            bool validPress=hasPress && pressedVersion==layoutVersion;ClearPress();
+            if(!validPress || chosen==null)return;
             for(int i=0;i<cards.Count;i++)
             {
-                Card c=cards[i];if(c.Bounds.IsEmpty || !c.Bounds.Contains(e.Location))continue;
-                if(!c.Window.Valid){LoadCards();selected=Math.Min(selected,cards.Count-1);Present();return;}
-                if(c.Close.Contains(e.Location))
+                Card c=cards[i];if(c.Window.Handle!=chosen.Handle || c.Window.ProcessId!=chosen.ProcessId || c.Bounds!=bounds || c.Bounds.IsEmpty || !c.Bounds.Contains(e.Location))continue;
+                if(!chosen.Valid){LoadCards();selected=Math.Min(selected,cards.Count-1);Present();return;}
+                if(close && c.Close.Contains(e.Location))
                 {
                     // Title, thumbnail, click, and close all use this same WindowEntry.
-                    Native.PostMessage(c.Window.Handle,0x112,new IntPtr(0xF060),IntPtr.Zero);
+                    Native.PostMessage(chosen.Handle,0x112,new IntPtr(0xF060),IntPtr.Zero);
                     selected=i;Invalidate();return;
                 }
-                ActivateCard(c.Window);return;
+                if(!close && !c.Close.Contains(e.Location))ActivateCard(chosen);return;
             }
+        }
+        private void PressCard(object sender,MouseEventArgs e)
+        {
+            if(e.Button!=MouseButtons.Left)return;
+            ClearPress();hasPress=true;pressedVersion=layoutVersion;
+            foreach(Card card in cards)if(!card.Bounds.IsEmpty && card.Bounds.Contains(e.Location))
+            {pressed=card.Window;pressedBounds=card.Bounds;pressedClose=card.Close.Contains(e.Location);return;}
         }
         internal void ActivateCard(WindowEntry w)
         {
-            pending=w;keyboardMove=false;activating=true;pinned=false;sequence=false;Dismiss();Native.ReleaseAlt();activateTimer.Interval=ResponsePolicy.WindowActivation;activateTimer.Start();
+            Schedule(w,true);
+        }
+        private void Schedule(WindowEntry w,bool mouse)
+        {
+            CancelPending();pending=w;activating=true;suppressRelease=true;pinned=false;sequence=false;Dismiss();
+            if(mouse)releaseAlt(); // Physical Alt-up already ended keyboard selection.
+            activateTimer.Interval=mouse?ResponsePolicy.WindowActivation:Math.Max(90,ResponsePolicy.WindowActivation);activateTimer.Start();
         }
         private static void ShowMoveFailure(){MessageBox.Show("此窗口未能移到副屏。请确认副屏仍已连接；管理员窗口需要以相同权限运行副屏助手。","无法移动窗口");}
         private void Dismiss(){guardTimer.Stop();Hide();ClearCards();}
-        private void ClearCards(){foreach(Card c in cards)if(c.Thumbnail!=IntPtr.Zero)Native.DwmUnregisterThumbnail(c.Thumbnail);cards.Clear();}
+        private void ClearCards(){layoutVersion++;foreach(Card c in cards)if(c.Thumbnail!=IntPtr.Zero)Native.DwmUnregisterThumbnail(c.Thumbnail);cards.Clear();}
     }
 }

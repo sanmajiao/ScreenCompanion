@@ -24,9 +24,14 @@ namespace DesktopPortal
         private FileSystemWatcher watcher;
         private FileSystemWatcher commonWatcher;
         private ScreenCompanion.MouseListener mouseListener;
+        private readonly DesktopIconReadQueue nativeReads;
+        private int nativeReadVersion;
+        private bool nativeReadClosed;
 
-        public DesktopLayerForm()
+        public DesktopLayerForm() : this(DesktopIconReadQueue.Shared) { }
+        internal DesktopLayerForm(DesktopIconReadQueue reads)
         {
+            nativeReads = reads;
             Text = "副屏桌面克隆";
             FormBorderStyle = FormBorderStyle.None;
             ShowInTaskbar = false;
@@ -53,6 +58,7 @@ namespace DesktopPortal
             {
                 BeginInvoke((MethodInvoker)delegate
                 {
+                    if (IsDisposed || Disposing || nativeReadClosed) return;
                     AttachAndPlace();
                     LoadDesktopItems();
                     StartWatcher();
@@ -63,6 +69,8 @@ namespace DesktopPortal
             };
             FormClosing += delegate
             {
+                nativeReadClosed = true;
+                nativeReadVersion++;
                 if (watcher != null) watcher.Dispose();
                 if (commonWatcher != null) commonWatcher.Dispose();
                 refreshTimer.Dispose();
@@ -135,10 +143,40 @@ namespace DesktopPortal
         private void LoadDesktopItems()
         {
             Screen right = FindRightScreen();
-            if (right == null) return;
-            canvas.SetNativeDesktopIcons(NativeDesktopIconReader.Read(right.Bounds), right.Bounds.Location);
-            canvas.LoadItems();
-            ApplyInteractiveRegion();
+            int version = ++nativeReadVersion;
+            if (right == null || nativeReadClosed) return;
+            string device = right.DeviceName;
+            Rectangle bounds = right.Bounds;
+            // Explorer can block a synchronous ListView message indefinitely.
+            // Keep the entire native read and its remote-buffer lifetime off
+            // the UI thread; retain only one latest pending refresh globally.
+            nativeReads.Enqueue(bounds, delegate(List<NativeDesktopIcon> icons)
+            {
+                try
+                {
+                    if (IsDisposed || !IsHandleCreated) return;
+                    BeginInvoke((MethodInvoker)delegate
+                    {
+                        if (IsDisposed || Disposing) return;
+                        Screen current = FindRightScreen();
+                        if (!CanApplyNativeRead(nativeReadClosed, version, nativeReadVersion, device, bounds,
+                            current == null ? null : current.DeviceName, current == null ? Rectangle.Empty : current.Bounds)) return;
+                        canvas.SetNativeDesktopIcons(icons, bounds.Location);
+                        // Directory enumeration/layout keeps its existing UI
+                        // path; only Explorer's cross-process read moved out.
+                        canvas.LoadItems();
+                        ApplyInteractiveRegion();
+                    });
+                }
+                catch (InvalidOperationException) { }
+            });
+        }
+
+        internal static bool CanApplyNativeRead(bool closed, int requestedVersion, int currentVersion,
+            string requestedDevice, Rectangle requestedBounds, string currentDevice, Rectangle currentBounds)
+        {
+            return !closed && requestedVersion == currentVersion && currentDevice != null &&
+                String.Equals(requestedDevice, currentDevice, StringComparison.Ordinal) && requestedBounds == currentBounds;
         }
 
         private void ApplyInteractiveRegion()
@@ -700,6 +738,57 @@ namespace DesktopPortal
     {
         public string Name;
         public Point ScreenPosition;
+    }
+
+    // Shared across desktop-layer replacements. A stalled Explorer read cannot
+    // create another blocked worker on every Apply or directory notification.
+    internal sealed class DesktopIconReadQueue
+    {
+        private sealed class Work
+        {
+            internal Rectangle Bounds;
+            internal Action<List<NativeDesktopIcon>> Complete;
+        }
+        internal static readonly DesktopIconReadQueue Shared = new DesktopIconReadQueue(NativeDesktopIconReader.Read);
+        private readonly object sync = new object();
+        private readonly Func<Rectangle, List<NativeDesktopIcon>> read;
+        private Work pending;
+        private bool running;
+        private bool reportedReadFailure;
+        internal DesktopIconReadQueue(Func<Rectangle, List<NativeDesktopIcon>> reader) { read = reader; }
+        internal void Enqueue(Rectangle bounds, Action<List<NativeDesktopIcon>> complete)
+        {
+            lock (sync)
+            {
+                pending = new Work { Bounds = bounds, Complete = complete };
+                if (running) return;
+                running = true;
+            }
+            ThreadPool.QueueUserWorkItem(delegate { Drain(); });
+        }
+        private void Drain()
+        {
+            while (true)
+            {
+                Work work;
+                lock (sync)
+                {
+                    work = pending;
+                    pending = null;
+                    if (work == null) { running = false; return; }
+                }
+                List<NativeDesktopIcon> result;
+                try { result = read(work.Bounds); reportedReadFailure = false; }
+                catch (Exception error)
+                {
+                    if (!reportedReadFailure) ScreenCompanion.Program.Log(error);
+                    reportedReadFailure = true;
+                    result = new List<NativeDesktopIcon>();
+                }
+                try { work.Complete(result); }
+                catch (Exception error) { ScreenCompanion.Program.Log(error); }
+            }
+        }
     }
 
     internal static class NativeDesktopIconReader

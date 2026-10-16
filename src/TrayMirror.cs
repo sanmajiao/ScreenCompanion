@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.Windows.Forms;
@@ -16,8 +16,9 @@ namespace ScreenCompanion
         private readonly Func<Point,MouseButtons,Point,bool> click;
         private readonly System.Threading.Timer watchdog;
         private readonly int duration;
-        private int userMovement,ownedMovement,started;
-        private bool active,moved,disposed;
+        private int userMovement,ownedMovement,started,restoreStarted,restoreAttempts;
+        private long ownPoint;
+        private bool active,moved,disposed,restoring,returnFailed;
         private Point origin,expected;
         internal TrayPointerLease(Func<Point> read,Func<Point,bool> move,Func<Point,MouseButtons,Point,bool> click,int duration)
         {
@@ -26,35 +27,69 @@ namespace ScreenCompanion
         }
         internal void ObserveUserMovement(){System.Threading.Interlocked.Increment(ref userMovement);}
         internal void ObserveMovement(IntPtr extra){if(extra!=Native.PointerInputTag)ObserveUserMovement();}
-        internal void Begin(Point point)
+        private static long Pack(Point point){return ((long)point.X<<32)|(uint)point.Y;}
+        internal void ObserveInput(int message,Point point,uint flags,IntPtr extra)
+        {
+            // No lock here: SendInput can synchronously wait for this hook.
+            if(extra==Native.PointerInputTag)
+            {
+                if(message==0x200)System.Threading.Interlocked.Exchange(ref ownPoint,Pack(point));
+                return;
+            }
+            // Remote tools may echo an unchanged injected mouse position.
+            // Actual remote movement (even one pixel), buttons and wheels still
+            // revoke ownership, as does every physical mouse event.
+            if(message==0x200 && (flags&3)!=0 && Pack(point)==System.Threading.Interlocked.Read(ref ownPoint))return;
+            ObserveUserMovement();
+        }
+        internal bool Begin(Point point)
         {
             lock(sync)
             {
-                if(disposed)return;FinishLocked();origin=expected=point;moved=false;
+                if(disposed || restoring)return false;
+                if(active){FinishLocked();if(active || !TryRead(out point))return false;}
+                origin=expected=point;moved=false;returnFailed=false;
+                System.Threading.Interlocked.Exchange(ref ownPoint,Pack(point));
                 ownedMovement=System.Threading.Volatile.Read(ref userMovement);started=Environment.TickCount;active=true;watchdog.Change(25,25);
+                return true;
             }
         }
+        private bool TryRead(out Point point){try{point=read();return true;}catch{point=Point.Empty;return false;}}
+        private static bool Near(Point a,Point b){return Math.Abs((long)a.X-b.X)<=2 && Math.Abs((long)a.Y-b.Y)<=2;}
+        private bool SameUser(){return active && System.Threading.Volatile.Read(ref userMovement)==ownedMovement;}
         // Absolute desktop input can quantize by a physical pixel. The hook
         // generation still rejects even a one-pixel movement made by the user.
-        private bool Owned(){Point actual=read();return active && System.Threading.Volatile.Read(ref userMovement)==ownedMovement && Math.Abs((long)actual.X-expected.X)<=2 && Math.Abs((long)actual.Y-expected.Y)<=2;}
-        internal bool IsOwned{get{lock(sync){return Owned();}}}
+        private bool Owned(){Point actual;return SameUser() && TryRead(out actual) && Near(actual,expected);}
+        private bool CanForward()
+        {
+            if(restoring || !active)return false;
+            if(Environment.TickCount-started>=duration || !Owned()){FinishLocked();return false;}
+            return true;
+        }
+        internal bool IsOwned{get{lock(sync){return CanForward();}}}
         internal bool HasMoved{get{lock(sync){return moved;}}}
+        internal bool RestorationPending{get{lock(sync){return restoring;}}}
+        internal bool ReturnFailed{get{lock(sync){return returnFailed;}}}
+        internal Point Origin{get{lock(sync){return origin;}}}
         internal bool Move(Point point)
         {
             lock(sync)
             {
-                if(!Owned()){FinishLocked();return false;}
+                if(!CanForward())return false;
                 // Set expected before injection; the hook ignores our tagged
                 // events and never takes this lock while SendInput is running.
                 expected=point;moved=true;
-                bool ok=move(point);if(!ok){FinishLocked();return false;}return true;
+                System.Threading.Interlocked.Exchange(ref ownPoint,Pack(point));
+                bool ok=false;try{ok=move(point);}catch{}
+                Point actual;if(ok && TryRead(out actual) && Near(actual,point))System.Threading.Interlocked.Exchange(ref ownPoint,Pack(actual));
+                if(!ok){FinishLocked();return false;}return true;
             }
         }
         internal bool Click(Point point,MouseButtons button)
         {
             lock(sync)
             {
-                if(!Owned()){FinishLocked();return false;}
+                if(!CanForward())return false;
                 expected=point;moved=true;
                 try{return click(point,button,origin);}
                 finally{FinishLocked();}
@@ -65,17 +100,50 @@ namespace ScreenCompanion
             lock(sync)
             {
                 if(!active)return;
+                if(restoring){TryRestoreLocked();return;}
                 if(!Owned() || Environment.TickCount-started>=duration)FinishLocked();
             }
         }
         private void FinishLocked()
         {
             if(!active)return;
-            try{if(moved && Owned())move(origin);}
-            finally{active=false;moved=false;watchdog.Change(System.Threading.Timeout.Infinite,System.Threading.Timeout.Infinite);}
+            if(restoring){TryRestoreLocked();return;}
+            if(!moved || !SameUser()){ClearLocked(false);return;}
+            restoring=true;restoreStarted=Environment.TickCount;restoreAttempts=0;TryRestoreLocked();
+        }
+        private void TryRestoreLocked()
+        {
+            if(!SameUser()){ClearLocked(false);return;}
+            Point actual;
+            if(TryRead(out actual))
+            {
+                if(Near(actual,origin)){ClearLocked(false);return;}
+                if(!Near(actual,expected)){ClearLocked(false);return;}
+                if(restoreAttempts<8 && Environment.TickCount-restoreStarted<250)
+                {
+                    restoreAttempts++;try{move(origin);}catch{}
+                    if(TryRead(out actual) && Near(actual,origin)){ClearLocked(false);return;}
+                }
+            }
+            if(restoreAttempts>=8 || Environment.TickCount-restoreStarted>=250)ClearLocked(true);
+        }
+        private void ClearLocked(bool failed)
+        {
+            active=moved=restoring=false;returnFailed=failed;
+            watchdog.Change(System.Threading.Timeout.Infinite,System.Threading.Timeout.Infinite);
+            if(disposed)watchdog.Dispose();
         }
         internal void Finish(){lock(sync){FinishLocked();}}
-        public void Dispose(){lock(sync){if(disposed)return;FinishLocked();disposed=true;watchdog.Dispose();}}
+        public void Dispose()
+        {
+            lock(sync)
+            {
+                if(disposed)return;disposed=true;FinishLocked();
+                // FormClosing removes our input hook next. Never leave delayed
+                // moves alive after that user-input guard has disappeared.
+                if(active)ClearLocked(true);else watchdog.Dispose();
+            }
+        }
     }
 
     internal sealed class TrayMirrorForm : Form
@@ -123,6 +191,9 @@ namespace ScreenCompanion
         private readonly TrayPixelBuffer pixels=new TrayPixelBuffer();
         private int lastClockSecond=-1;
         private bool started;
+        private bool closing;
+        private int autoRevealAfter=Environment.TickCount;
+        private bool overflowKnown;
         internal TrayMirrorForm(Action settings)
         {
             Text="副屏真实托盘";FormBorderStyle=FormBorderStyle.None;ShowInTaskbar=false;StartPosition=FormStartPosition.Manual;TopMost=true;AutoScaleMode=AutoScaleMode.None;
@@ -174,7 +245,7 @@ namespace ScreenCompanion
                 else if(++revealAttempts>=75){Text="托盘未能展开，点击重试";EndForward();}
             };
             Shown+=delegate{Start();};
-            FormClosing+=delegate{timer.Stop();EndForward();pointer.Dispose();popupTimer.Stop();RestoreOverflow();StopPopupHooks();flyouts.Dispose();if(wallpaper!=null)wallpaper.Dispose();pixels.Dispose();timer.Dispose();revealTimer.Dispose();popupTimer.Dispose();if(picture.Image!=null){picture.Image.Dispose();picture.Image=null;}if(lastTrayFrame!=null)lastTrayFrame.Dispose();tip.Dispose();};
+            FormClosing+=delegate{closing=true;timer.Stop();EndForward();pointer.Dispose();popupTimer.Stop();RestoreOverflow();StopPopupHooks();flyouts.Dispose();if(wallpaper!=null)wallpaper.Dispose();pixels.Dispose();timer.Dispose();revealTimer.Dispose();popupTimer.Dispose();if(picture.Image!=null){picture.Image.Dispose();picture.Image=null;}if(lastTrayFrame!=null)lastTrayFrame.Dispose();tip.Dispose();};
         }
         internal void Start()
         {
@@ -200,15 +271,15 @@ namespace ScreenCompanion
             IntPtr host=taskbarHost;
             if(host==IntPtr.Zero || !Native.IsWindow(host) || Screen.FromHandle(host).DeviceName!=target.DeviceName)host=FindTargetTaskbar();
             if(host==IntPtr.Zero){Hide();return;}
-            Rectangle bar;
-            if(!ReadTaskbarExposure(host,target.Bounds,out bar)){if(Visible)Hide();return;}
-            if(taskbarHost!=host)
-            {
-                taskbarHost=host;
-            }
+            // Remember a valid host even while hidden, avoiding EnumWindows on
+            // every poll. Its visibility is independent of passive source warmup.
+            taskbarHost=host;Rectangle bar;
+            bool exposed=ReadTaskbarExposure(host,target.Bounds,out bar);
+            if(!exposed && Visible)Hide();
             source=FindTrayBounds();
             if(source.IsEmpty)
             {
+                if(!exposed)return;
                 if(picture.Image!=null){picture.Image.Dispose();picture.Image=null;}
                 picture.BackColor=BackColor;picture.Invalidate();
                 Text="副屏托盘：主屏托盘隐藏或无法识别";
@@ -218,28 +289,30 @@ namespace ScreenCompanion
             int maxWidth=Math.Min(Settings.Current.TrayWidth,Math.Max(100,target.Bounds.Width-46));
             int h=bar.Height;
             double scale=Math.Min(h/(double)source.Height,maxWidth/(double)source.Width);int w=Math.Max(40,(int)(source.Width*scale));
-            Place(target,bar,w+30,h);
-            if(!Visible)return;
             if(!SourceVisible(source))
             {
                 Text="主屏已隐藏；保留上次托盘画面，点击展开操作";
-                if(picture.Image==null && !forwarding)BeginReveal(false);
-                else if(Visible)RefreshHiddenClock();
+                if(exposed && picture.Image==null && !forwarding && Environment.TickCount-autoRevealAfter>=0)BeginReveal(false);
+                else if(exposed && picture.Image!=null)RefreshHiddenClock();
+                if(exposed && picture.Image!=null)Place(target,bar,w+30,h);
                 return;
             }
-            if(Environment.TickCount-capturePausedUntil<0 || (Environment.TickCount-lastFrame<ResponsePolicy.TrayFrame && picture.Image!=null))return;
-            lastFrame=Environment.TickCount;Text="副屏真实托盘";
-            Bitmap image=null;
-            try
+            // Warm a real frame whenever primary pixels exist, including while
+            // the secondary taskbar is hidden. Never show an unpainted mirror.
+            if(Environment.TickCount-capturePausedUntil>=0 && (Environment.TickCount-lastFrame>=ResponsePolicy.TrayFrame || picture.Image==null))
             {
-                image=new Bitmap(source.Width,source.Height,PixelFormat.Format32bppPArgb);
-                using(var g=Graphics.FromImage(image))g.CopyFromScreen(source.Location,Point.Empty,source.Size);
-                if(lastTrayFrame!=null)lastTrayFrame.Dispose();lastTrayFrame=(Bitmap)image.Clone();
-                lastTraySource=source;
-                SetImage(image);image=null;
+                lastFrame=Environment.TickCount;Text="副屏真实托盘";Bitmap image=null;
+                try
+                {
+                    image=new Bitmap(source.Width,source.Height,PixelFormat.Format32bppPArgb);
+                    using(var g=Graphics.FromImage(image))g.CopyFromScreen(source.Location,Point.Empty,source.Size);
+                    if(lastTrayFrame!=null)lastTrayFrame.Dispose();lastTrayFrame=(Bitmap)image.Clone();
+                    lastTraySource=source;SetImage(image);image=null;
+                }
+                catch { Text="副屏托盘：屏幕暂不可捕获"; }
+                finally{if(image!=null)image.Dispose();}
             }
-            catch { Text="副屏托盘：屏幕暂不可捕获"; }
-            finally{if(image!=null)image.Dispose();}
+            if(exposed && picture.Image!=null)Place(target,bar,w+30,h);
         }
         internal static IntPtr FindTargetTaskbar()
         {
@@ -333,15 +406,46 @@ namespace ScreenCompanion
                     g.CompositingMode=System.Drawing.Drawing2D.CompositingMode.SourceOver;
                 }
                 using(var b=new SolidBrush(BackColor))g.FillRectangle(b,0,0,30,Height);
+                if(overflowKnown || FindOverflowWindow()!=IntPtr.Zero)DrawOverflowIndicator(g,(Bitmap)picture.Image,new Rectangle(30,0,Width-30,Height),Settings.Current.TransparentTray,
+                    openingOverflow || managedOverflow || FindOverflowWindow()!=IntPtr.Zero,Native.Dpi(Native.FindWindow("Shell_TrayWnd",null)));
                 using(var font=new Font("Segoe UI",14))using(var b=new SolidBrush(Color.White))using(var format=new StringFormat{Alignment=StringAlignment.Center,LineAlignment=StringAlignment.Center})g.DrawString("⚙",font,b,new RectangleF(0,0,30,Height),format);
                 TraySurface.Present(Handle,surface,Location);
             }
         }
-        private void RefreshHiddenClock()
+        internal static void DrawOverflowIndicator(Graphics graphics,Bitmap image,Rectangle destination,bool transparent,bool expanded,uint dpi)
+        {
+            // The chevron is an assistant state indicator. Hiding the relocated
+            // native flyout can leave Shell's source chevron logically pressed;
+            // drawing from our real popup state also handles a stale first frame.
+            int sourceWidth=Math.Min(image.Width,Math.Max(1,(int)(32L*Math.Max(96u,dpi)/96)));
+            int width=Math.Max(1,(int)Math.Round(sourceWidth*destination.Width/(double)image.Width));
+            Rectangle cell=new Rectangle(destination.X,destination.Y,width,destination.Height);
+            Color background=image.GetPixel(0,0),foreground=background.GetBrightness()>0.5f?Color.FromArgb(40,40,40):Color.White;
+            if(transparent)
+            {
+                // Sample the genuine glyph at its center, excluding faint matte
+                // remnants and hover fills. This preserves light/dark icon color.
+                int best=-1;
+                for(int y=Math.Max(0,image.Height/2-image.Height/8);y<Math.Min(image.Height,image.Height/2+image.Height/8);y++)
+                    for(int x=Math.Max(0,sourceWidth/2-sourceWidth/4);x<Math.Min(image.Width,sourceWidth/2+sourceWidth/4);x++)
+                    {Color c=image.GetPixel(x,y);if(c.A>best && c.A>=180){best=c.A;foreground=Color.FromArgb(255,c.R,c.G,c.B);}}
+            }
+            graphics.CompositingMode=System.Drawing.Drawing2D.CompositingMode.SourceCopy;
+            using(var brush=new SolidBrush(transparent?Color.FromArgb(1,0,0,0):background))graphics.FillRectangle(brush,cell);
+            graphics.CompositingMode=System.Drawing.Drawing2D.CompositingMode.SourceOver;
+            var smoothing=graphics.SmoothingMode;graphics.SmoothingMode=System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            float centerX=cell.Left+cell.Width/2f,centerY=cell.Top+cell.Height/2f;
+            float half=Math.Max(2f,Math.Min(cell.Width*0.16f,cell.Height*0.11f)),rise=half*0.58f;
+            using(var pen=new Pen(foreground,Math.Max(1.25f,cell.Height/32f)))
+                graphics.DrawLines(pen,new[]{new PointF(centerX-half,centerY+(expanded?-rise:rise)),new PointF(centerX,centerY+(expanded?rise:-rise)),new PointF(centerX+half,centerY+(expanded?-rise:rise))});
+            graphics.SmoothingMode=smoothing;
+        }
+        private void RefreshHiddenClock(){RefreshHiddenClockCore(false);}
+        private void RefreshHiddenClockCore(bool force)
         {
             // Keep system time current while an auto-hidden primary taskbar has no
             // visible pixels; application icons retain the last real tray frame.
-            DateTime now=DateTime.Now;if(lastTrayFrame==null || lastClockSecond==now.Second)return;lastClockSecond=now.Second;
+            DateTime now=DateTime.Now;if(lastTrayFrame==null || (!force && lastClockSecond==now.Second))return;lastClockSecond=now.Second;
             Bitmap frame=(Bitmap)lastTrayFrame.Clone();
             // Transparent mode exposes the secondary native clock. Painting a
             // synthetic primary clock would contaminate wallpaper-fit margins.
@@ -364,10 +468,11 @@ namespace ScreenCompanion
             ForwardCount++;
             picture.Capture=false;
             if(source.IsEmpty || forwarding || (e.Button!=MouseButtons.Left && e.Button!=MouseButtons.Right))return;
-            bool arrow=e.Button==MouseButtons.Left && e.X/(float)Math.Max(1,picture.Width)*source.Width<32;
+            bool arrow=e.Button==MouseButtons.Left && e.X/(float)Math.Max(1,picture.Width)*source.Width<32L*Native.Dpi(Native.FindWindow("Shell_TrayWnd",null))/96;
             if(arrow)
             {
                 if(managedOverflow){RestoreOverflow();return;}
+
                 clickStarted=Environment.TickCount;LastPopupLatency=-1;openingOverflow=true;popupTimer.Interval=16;popupTimer.Start();
             }
             // Recheck the source; a layout change must never click a stale coordinate.
@@ -411,11 +516,12 @@ namespace ScreenCompanion
             }
             Screen screen=Settings.TargetScreen();if(screen==null)return;
             Rectangle r=Native.Bounds(h);if(r.Width<10 || r.Height<10)return;
-            if(movedPopup!=h){movedPopup=h;originalPopupBounds=r;originalPopupDpi=Native.Dpi(h);managedOverflow=true;}
+            overflowKnown=true;if(movedPopup!=h){movedPopup=h;originalPopupBounds=r;originalPopupDpi=Native.Dpi(h);managedOverflow=true;}
             double scale=Native.Dpi(taskbarHost)/(double)Math.Max(1,originalPopupDpi);
             int width=Math.Max(10,(int)Math.Round(originalPopupBounds.Width*scale));
             int height=Math.Max(10,(int)Math.Round(originalPopupBounds.Height*scale));
-            Point anchor=picture.PointToScreen(new Point(Math.Min(picture.Width-1,(int)(16*picture.Width/(double)Math.Max(1,source.Width))),0));
+            double sourceArrowCenter=16*Native.Dpi(Native.FindWindow("Shell_TrayWnd",null))/96.0;
+            Point anchor=picture.PointToScreen(new Point(Math.Min(picture.Width-1,(int)(sourceArrowCenter*picture.Width/Math.Max(1,source.Width))),0));
             int x=Math.Max(screen.Bounds.Left,Math.Min(screen.Bounds.Right-width,anchor.X-width/2));
             int y=Math.Max(screen.Bounds.Top,Math.Min(screen.Bounds.Bottom-height,Top-height-6));
             var desired=new Rectangle(x,y,width,height);
@@ -441,6 +547,8 @@ namespace ScreenCompanion
                 Native.SetWindowPos(movedPopup,IntPtr.Zero,r.X,r.Y,r.Width,r.Height,0x10|4);
             }
             movedPopup=IntPtr.Zero;
+
+            if(!closing && lastTrayFrame!=null && !SourceVisible(FindTrayBounds()))RefreshHiddenClockCore(true);
         }
         private void InstallPopupHooks()
         {
@@ -452,7 +560,7 @@ namespace ScreenCompanion
                     var movement=(Native.MouseData)System.Runtime.InteropServices.Marshal.PtrToStructure(l,typeof(Native.MouseData));
                     // Clicking or scrolling while a reveal is pending also
                     // revokes it; our whole native batch carries the same tag.
-                    pointer.ObserveMovement(movement.Extra);
+                    pointer.ObserveInput(w.ToInt32(),movement.Point,movement.Flags,movement.Extra);
                 }
                 if(code>=0 && managedOverflow && (w==new IntPtr(0x201)||w==new IntPtr(0x204)||w==new IntPtr(0x207)))
                 {
@@ -515,11 +623,12 @@ namespace ScreenCompanion
         }
         private void BeginReveal(bool click)
         {
-            if(forwarding)return;
+            if(forwarding || pointer.RestorationPending)return;
             IntPtr taskbar=Native.FindWindow("Shell_TrayWnd",null);if(taskbar==IntPtr.Zero)return;
             Rectangle b=Screen.FromHandle(taskbar).Bounds,tr=Native.Bounds(taskbar);
-            returnCursor=Cursor.Position;pendingClick=click;revealAttempts=0;forwarding=true;stableSource=Rectangle.Empty;
-            pointer.Begin(returnCursor);
+            if(!pointer.Begin(Cursor.Position))return;
+            returnCursor=pointer.Origin;pendingClick=click;revealAttempts=0;forwarding=true;stableSource=Rectangle.Empty;
+            if(!click)autoRevealAfter=Environment.TickCount+1500;
             int x=Math.Max(b.Left,Math.Min(b.Right-2,tr.Right-70));int y=Math.Max(b.Top,Math.Min(b.Bottom-1,tr.Top+2));
             if(tr.Height>tr.Width){x=Math.Max(b.Left,Math.Min(b.Right-1,tr.Left+2));y=Math.Max(b.Top,Math.Min(b.Bottom-2,tr.Bottom-70));}
             Rectangle live=FindTrayBounds();

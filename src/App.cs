@@ -100,6 +100,21 @@ namespace ScreenCompanion
             // Low-rate topology check also recovers after Explorer restarts.
             topologyTimer.Interval=3000;topologyTimer.Tick+=delegate { string t=Topology();if(t!=topology)Apply(); };topologyTimer.Start();
             Apply(); if(show)ShowSettings();
+            // Retry once after the first message-loop turn. Construction can
+            // precede Shell becoming ready to accept the notification icon.
+            Dispatch(RegisterTrayIcon);
+        }
+        private void RegisterTrayIcon()
+        {
+            if(dispatcher.IsDisposed)return;
+            tray.Visible=false;tray.Visible=true;
+        }
+        internal void HideSettings()
+        {
+            // Re-register before hiding the only visible entry point; this also
+            // retries a failed cold-start Shell registration without a delay.
+            RegisterTrayIcon();
+            if(settings!=null && !settings.IsDisposed)settings.Hide();
         }
         private void Dispatch(Action a) { try { if(!dispatcher.IsDisposed)dispatcher.BeginInvoke(a); } catch { } }
         private void DisplayChanged(object sender,EventArgs e) { Dispatch(Apply); }
@@ -201,13 +216,13 @@ namespace ScreenCompanion
                 try { Settings.Current.Save();context.Apply();status.Text="设置已保存。关闭这个窗口后，副屏功能继续运行。"; }
                 catch(Exception e) { MessageBox.Show("设置未能保存："+e.Message,"副屏助手"); }
             };
-            var hide=new Button{Text="收起到托盘",AutoSize=true,MinimumSize=new Size(120,38)};hide.Click+=delegate{Hide();};buttons.Controls.Add(hide);
+            var hide=new Button{Text="收起到托盘",AutoSize=true,MinimumSize=new Size(120,38)};hide.Click+=delegate{context.HideSettings();};buttons.Controls.Add(hide);
             var exit=new Button{Text="退出",AutoSize=true,MinimumSize=new Size(90,38)};exit.Click+=delegate{context.ExitThread();};buttons.Controls.Add(exit);
             desktop.Checked=Settings.Current.Desktop;alt.Checked=Settings.Current.AltTab;tray.Checked=Settings.Current.Tray;width.Value=Settings.Current.TrayWidth;
             move.Checked=Settings.Current.MoveOnSwitch;transparent.Checked=Settings.Current.TransparentTray;quality.SelectedIndex=Settings.Current.ImageQuality;highResponse.Checked=Settings.Current.HighResponse;wallpaperAware.Checked=Settings.Current.WallpaperAwareTray;
             Shown+=delegate{Rectangle area=Screen.FromControl(this).WorkingArea;Size=new Size(Math.Min(Width,area.Width-24),Math.Min(Height,area.Height-24));};
             Disposed+=delegate{help.Dispose();};
-            FormClosing+=delegate(object s,FormClosingEventArgs e){if(e.CloseReason==CloseReason.UserClosing){e.Cancel=true;Hide();}};
+            FormClosing+=delegate(object s,FormClosingEventArgs e){if(e.CloseReason==CloseReason.UserClosing){e.Cancel=true;context.HideSettings();}};
             RefreshStatus();
         }
         private static void AddRow(TableLayoutPanel panel,Control control)

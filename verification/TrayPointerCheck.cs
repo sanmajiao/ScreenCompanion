@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Drawing;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -19,26 +19,201 @@ namespace ScreenCompanion
             internal MouseButtons Button;
             internal int Mode;
             internal int Offset;
+            internal int FailedReturns;
+            internal int ThrowReturns,LyingReturns,ReadFailures;
             internal readonly ManualResetEvent Restored=new ManualResetEvent(false);
-            internal Point Read(){return Position;}
-            internal bool Move(Point point){Position=new Point(point.X+Offset,point.Y-Offset);Interlocked.Increment(ref Moves);Restored.Set();return true;}
+            internal Point Read(){if(ReadFailures>0){ReadFailures--;throw new InvalidOperationException("fixture cursor temporarily unavailable");}return Position;}
+            internal bool Move(Point point)
+            {
+                Interlocked.Increment(ref Moves);
+                if(point==new Point(1900,800))
+                {
+                    if(ThrowReturns>0){ThrowReturns--;throw new InvalidOperationException("fixture return temporarily unavailable");}
+                    if(FailedReturns>0){FailedReturns--;return false;}
+                    if(LyingReturns>0){LyingReturns--;return true;}
+                }
+                Position=new Point(point.X+Offset,point.Y-Offset);Restored.Set();return true;
+            }
             internal bool Click(Point point,MouseButtons button,Point origin)
             {
                 Target=point;Return=origin;Button=button;Clicks++;
                 if(Mode==1){Position=point;return false;}
                 if(Mode==2){Position=point;throw new InvalidOperationException("fixture rejection");}
+                if(Mode==3)return false;
                 Position=origin;return true;
             }
             internal TrayPointerLease Lease(int deadline){return new TrayPointerLease(Read,Move,Click,deadline);}
         }
-        [STAThread] static int Main()
+        [STAThread] static int Main(string[] args)
         {
             try
             {
-                InputSequence();VisibleClicks();HiddenLease();UserMovement();Failures();Deadline();TaskbarExposure();HiddenStartup();ContentBridgeExposure();
+                if(Array.IndexOf(args,"--repro-echo")>=0){InjectedEchoRegression();return 0;}
+                if(Array.IndexOf(args,"--repro-restore")>=0){TransientReturnRegression();return 0;}
+                InputSequence();VisibleClicks();HiddenLease();UserMovement();Failures();Deadline();InjectedEchoRegression();TransientReturnRegression();InputOwnership();ReturnRetries();ExpiredForward();CollapsedFrames();
+                if(Array.IndexOf(args,"--pointer-only")<0){TaskbarExposure();HiddenStartup();ContentBridgeExposure();}
                 Console.WriteLine("PASS: "+assertions+" tray pointer checks; simulated backend, no desktop input injected.");return 0;
             }
             catch(Exception error){Console.WriteLine("FAIL: "+error);return 1;}
+        }
+        private static void InjectedEchoRegression()
+        {
+            var backend=new Backend();Point origin=backend.Position;
+            using(var lease=backend.Lease(1500))
+            {
+                lease.Begin(origin);lease.Move(new Point(170,950));
+                lease.ObserveInput(0x200,backend.Position,1,new IntPtr(123));lease.Finish();
+                Check(backend.Position==origin,"foreign injected no-op echo must not strand the moved pointer");
+            }
+        }
+        private static void TransientReturnRegression()
+        {
+            var backend=new Backend();Point origin=backend.Position;
+            using(var lease=backend.Lease(1500))
+            {
+                lease.Begin(origin);lease.Move(new Point(170,950));backend.Restored.Reset();backend.FailedReturns=1;lease.Finish();
+                Check(backend.Restored.WaitOne(1000) && backend.Position==origin,"a rejected first return must be retried independently of the UI pump");
+            }
+        }
+        private static void InputOwnership()
+        {
+            foreach(uint flag in new[]{1u,3u})
+            {
+                var backend=new Backend{Offset=1};Point origin=backend.Position;
+                using(var lease=backend.Lease(1500))
+                {
+                    lease.Begin(origin);lease.Move(new Point(-100,950));
+                    lease.ObserveInput(0x200,backend.Position,1,Native.PointerInputTag);
+                    lease.ObserveInput(0x200,backend.Position,flag,new IntPtr(123));
+                    Check(lease.IsOwned,"unchanged foreign injected position echo preserves rounded ownership: "+flag);
+                    lease.Finish();Check(Math.Abs(backend.Position.X-origin.X)<=1,"injected position echo does not strand pointer: "+flag);
+                }
+            }
+            foreach(uint flag in new[]{0u,1u,3u})
+            {
+                var backend=new Backend();Point target=new Point(170,950);
+                using(var lease=backend.Lease(1500))
+                {
+                    lease.Begin(backend.Position);lease.Move(target);backend.Position=new Point(target.X+1,target.Y);
+                    lease.ObserveInput(0x200,backend.Position,flag,new IntPtr(123));lease.Finish();
+                    Check(backend.Position==new Point(target.X+1,target.Y) && !lease.IsOwned,"genuine one-pixel physical or remote movement stays put: "+flag);
+                }
+            }
+            foreach(int message in new[]{0x201,0x204,0x20A})
+            {
+                var backend=new Backend();Point target=new Point(170,950);
+                using(var lease=backend.Lease(1500))
+                {
+                    lease.Begin(backend.Position);lease.Move(target);lease.ObserveInput(message,target,1,new IntPtr(123));lease.Finish();
+                    Check(backend.Position==target,"injected button or wheel intent revokes return: "+message);
+                }
+            }
+            var physical=new Backend();
+            using(var lease=physical.Lease(1500))
+            {
+                lease.Begin(physical.Position);lease.Move(new Point(170,950));lease.ObserveInput(0x200,physical.Position,0,IntPtr.Zero);
+                lease.ObserveInput(0x200,physical.Position,1,new IntPtr(123));lease.Finish();
+                Check(physical.Position==new Point(170,950),"later injected echo never reclaims a lease revoked by physical input");
+            }
+        }
+        private static void ReturnRetries()
+        {
+            foreach(int failure in new[]{0,1,2,3})
+            {
+                var backend=new Backend();Point origin=backend.Position;
+                using(var lease=backend.Lease(1500))
+                {
+                    lease.Begin(origin);lease.Move(new Point(170,950));backend.Restored.Reset();
+                    if(failure==0)backend.FailedReturns=2;
+                    if(failure==1)backend.ThrowReturns=2;
+                    if(failure==2)backend.LyingReturns=2;
+                    if(failure==3)backend.ReadFailures=2;
+                    lease.Finish();
+                    Check(backend.Restored.WaitOne(1000) && backend.Position==origin,"watchdog retries failed, throwing, deferred, or unreadable return: "+failure);
+                    Check(!lease.RestorationPending && !lease.ReturnFailed,"successful retry releases restore state: "+failure);
+                }
+            }
+            var blocked=new Backend();Point home=blocked.Position;
+            using(var lease=blocked.Lease(1500))
+            {
+                lease.Begin(home);lease.Move(new Point(170,950));blocked.FailedReturns=10000;blocked.Restored.Reset();lease.Finish();
+                Check(lease.RestorationPending,"failed return remains owned pending watchdog recovery");
+                Check(!lease.Begin(blocked.Position) && lease.Origin==home,"pending return cannot replace home with temporary primary position");
+                Thread.Sleep(350);
+                Check(!lease.RestorationPending && lease.ReturnFailed && blocked.Moves<=9,"permanent native denial has bounded retries and exposes failure");
+            }
+            var canceled=new Backend();
+            using(var lease=canceled.Lease(1500))
+            {
+                lease.Begin(canceled.Position);lease.Move(new Point(170,950));canceled.FailedReturns=3;lease.Finish();
+                canceled.Position=new Point(171,950);lease.ObserveInput(0x200,canceled.Position,0,IntPtr.Zero);Thread.Sleep(100);
+                Check(canceled.Position==new Point(171,950) && !lease.RestorationPending,"physical movement cancels all queued return retries");
+            }
+            var partial=new Backend{Mode=1};home=partial.Position;
+            using(var lease=partial.Lease(1500))
+            {
+                lease.Begin(home);partial.FailedReturns=1;partial.Restored.Reset();
+                Check(!lease.Click(new Point(170,950),MouseButtons.Left),"partial native click reports failure");
+                Check(partial.Restored.WaitOne(1000) && partial.Position==home,"partial click return recovers after initial restore rejection");
+            }
+            var zero=new Backend{Mode=3};home=zero.Position;
+            using(var lease=zero.Lease(1500))
+            {
+                lease.Begin(home);Check(!lease.Click(new Point(170,950),MouseButtons.Right) && zero.Position==home && zero.Moves==0,"zero inserted inputs require no pointer recovery");
+            }
+            var restart=new Backend();home=restart.Position;
+            using(var lease=restart.Lease(1500))
+            {
+                lease.Begin(home);lease.Move(new Point(170,950));Point stale=restart.Position;
+                Check(lease.Begin(stale) && lease.Origin==home && restart.Position==home,"reentrant Begin rereads restored home instead of adopting stale primary point");
+            }
+            var closing=new Backend();home=closing.Position;var closeLease=closing.Lease(1500);
+            closeLease.Begin(home);closeLease.Move(new Point(170,950));closing.FailedReturns=1000;closing.Restored.Reset();closeLease.Dispose();
+            int afterDispose=closing.Moves;closing.Position=new Point(171,950);Thread.Sleep(100);
+            Check(closing.Position==new Point(171,950) && closing.Moves==afterDispose,"Dispose performs no delayed move after the input hook would be removed");
+            Check(closeLease.ReturnFailed && !closeLease.RestorationPending,"Dispose records native return rejection and terminates retries");
+        }
+        private static void ExpiredForward()
+        {
+            var backend=new Backend();Point home=backend.Position;
+            using(var lease=backend.Lease(10000))
+            {
+                lease.Begin(home);lease.Move(new Point(170,950));
+                // Simulate resuming a suspended/UI-blocked process before its
+                // timer callback runs. The dispatch path must enforce expiry.
+                object sync=Field(lease,"sync");lock(sync)
+                {
+                    typeof(TrayPointerLease).GetField("started",BindingFlags.Instance|BindingFlags.NonPublic).SetValue(lease,unchecked(Environment.TickCount-10001));
+                    Check(!lease.Click(new Point(170,950),MouseButtons.Left) && backend.Clicks==0,"late resumed dispatch cannot click before watchdog catches up");
+                }
+                Check(backend.Position==home,"late resumed dispatch restores its old hover");
+            }
+        }
+        private static void CollapsedFrames()
+        {
+            foreach(uint dpi in new[]{96u,144u,192u})
+            {
+                using(var source=new Bitmap(200,96))using(var closed=new Bitmap(200,96))using(var opened=new Bitmap(200,96))
+                {
+                    using(var g=Graphics.FromImage(source))g.Clear(Color.FromArgb(245,245,245));
+                    using(var g=Graphics.FromImage(closed)){g.Clear(Color.Red);TrayMirrorForm.DrawOverflowIndicator(g,source,new Rectangle(0,0,200,96),false,false,dpi);}
+                    using(var g=Graphics.FromImage(opened)){g.Clear(Color.Red);TrayMirrorForm.DrawOverflowIndicator(g,source,new Rectangle(0,0,200,96),false,true,dpi);}
+                    int width=(int)(32*dpi/96),topClosed=96,topOpened=96;
+                    for(int y=0;y<96;y++)for(int x=0;x<width;x++)
+                    {if(closed.GetPixel(x,y).GetBrightness()<0.4f)topClosed=Math.Min(topClosed,y);if(opened.GetPixel(x,y).GetBrightness()<0.4f)topOpened=Math.Min(topOpened,y);}
+                    int center=width/2;
+                    Check(closed.GetPixel(center,topClosed+1).GetBrightness()<0.4f,"collapsed chevron apex points up without relying on a previous native frame: "+dpi);
+                    Check(opened.GetPixel(center,topOpened+1).GetBrightness()>0.6f,"expanded chevron arms point down: "+dpi);
+                    Check(closed.GetPixel(width,48).ToArgb()==Color.Red.ToArgb() && opened.GetPixel(199,48).ToArgb()==Color.Red.ToArgb(),"live neighboring icons outside scaled button remain untouched: "+dpi);
+                }
+            }
+            using(var source=new Bitmap(200,48))using(var result=new Bitmap(200,48))
+            {
+                using(var g=Graphics.FromImage(source)){g.Clear(Color.Transparent);g.FillRectangle(Brushes.White,12,20,8,8);}
+                using(var g=Graphics.FromImage(result)){g.Clear(Color.Red);TrayMirrorForm.DrawOverflowIndicator(g,source,new Rectangle(0,0,200,48),true,false,96);}
+                Check(result.GetPixel(0,0).A==1 && result.GetPixel(32,20).ToArgb()==Color.Red.ToArgb(),"transparent arrow cell retains hit-test alpha while leaving neighboring pixels alone");
+                Check(result.GetPixel(16,22).R>180,"transparent dark-taskbar glyph preserves genuine light foreground");
+            }
         }
         private static void InputSequence()
         {
