@@ -93,6 +93,7 @@ namespace ScreenCompanion
         }
         private void Queue(Action a){try{if(!IsDisposed)BeginInvoke(a);}catch{}}
         internal void OpenPinned(){CancelPending();pinned=true;sequence=false;LoadCards();selected=0;Present();}
+        internal void RefreshAvailableArea(){if(Visible && !IsDisposed && !Disposing)Present();}
         private void ClearPress(){hasPress=false;pressed=null;pressedBounds=Rectangle.Empty;}
         private void CancelPending(){activateTimer.Stop();pending=null;keyboardMove=false;activating=false;suppressRelease=false;ClearPress();}
         private void CompleteSequence(bool completed)

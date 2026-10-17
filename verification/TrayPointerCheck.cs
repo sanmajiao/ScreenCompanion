@@ -418,10 +418,17 @@ namespace ScreenCompanion
             {
                 Settings.Current=new Settings{ScreenName=target.DeviceName,Desktop=false,AltTab=false,Tray=true,HighResponse=true,TransparentTray=true};
                 using(var own=new ExposureWindow{Text="隐藏启动自己的任务栏夹具",ShowInTaskbar=false,StartPosition=FormStartPosition.Manual,Location=new Point(target.Bounds.Left+30,target.Bounds.Top+30),Size=new Size(250,60)})
-                using(var mirror=new TrayMirrorForm(delegate{}))
                 {
                     IntPtr hidden=own.Handle;
-                    typeof(TrayMirrorForm).GetField("taskbarHost",BindingFlags.Instance|BindingFlags.NonPublic).SetValue(mirror,hidden);
+                    var capture=new TrayCaptureBackend
+                    {
+                        TargetScreen=delegate{return target;},TargetTaskbar=delegate{return hidden;},ReadTargetExposure=TrayMirrorForm.ReadTaskbarExposure,
+                        FindPrimaryTray=delegate{return Rectangle.Empty;},PrimaryContentReady=delegate(Rectangle r){return false;},
+                        Capture=delegate(Rectangle r){throw new Exception("hidden startup must never capture desktop pixels");},PrimaryDpi=delegate{return 96u;},EnableInputHooks=true
+                    };
+                    var backend=new Backend{Position=Cursor.Position};
+                    using(var mirror=new TrayMirrorForm(delegate{},capture,backend.Lease(1500)))
+                    {
                     mirror.Start();IntPtr handle=mirror.Handle;
                     Check(mirror.IsHandleCreated && !mirror.Visible && !Native.IsWindowVisible(handle),"Start creates a hidden mirror without outer Show resurrecting it");
                     var hook=(Thread)Field(mirror,"popupHookThread");
@@ -437,6 +444,8 @@ namespace ScreenCompanion
                     Check(hook.Join(1200),"hidden Close terminates native hook message thread");
                     Check((IntPtr)Field(mirror,"popupMouseHook")==IntPtr.Zero && (IntPtr)Field(mirror,"popupKeyboardHook")==IntPtr.Zero,"hidden Close releases native mouse and keyboard hooks");
                     mirror.Start();Check(mirror.IsDisposed && !timer.Enabled,"Start after Close never recreates disposed resources");
+                    Check(backend.Moves==0 && backend.Clicks==0,"hidden startup lifecycle uses no real or simulated pointer movement");
+                    }
                 }
             }
             finally{Settings.Current=previous;}

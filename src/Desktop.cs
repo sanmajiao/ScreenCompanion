@@ -193,6 +193,10 @@ namespace DesktopPortal
             LoadDesktopItems();
             desktopDirectoryStamp = GetDesktopDirectoryStamp();
         }
+        internal void RefreshShellLayout()
+        {
+            if(!IsDisposed && !Disposing && !nativeReadClosed)RefreshDesktopItems();
+        }
 
         private DateTime GetDesktopDirectoryStamp()
         {

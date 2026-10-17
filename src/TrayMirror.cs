@@ -5,6 +5,19 @@ using System.Windows.Forms;
 
 namespace ScreenCompanion
 {
+    internal delegate bool TrayExposureReader(IntPtr host,Rectangle screen,out Rectangle bar);
+    internal sealed class TrayCaptureBackend
+    {
+        internal Func<Screen> TargetScreen;
+        internal Func<IntPtr> TargetTaskbar;
+        internal TrayExposureReader ReadTargetExposure;
+        internal Func<Rectangle> FindPrimaryTray;
+        internal Func<Rectangle,bool> PrimaryContentReady;
+        internal Func<Rectangle,Bitmap> Capture;
+        internal Func<uint> PrimaryDpi;
+        internal Action<IntPtr,Bitmap,Point> PresentSurface;
+        internal bool EnableInputHooks=true;
+    }
     // A short lease over only the movements made by this mirror. The watchdog
     // does not use the Forms message pump, so a slow capture cannot strand the
     // pointer on the primary screen. Real input revokes the lease permanently.
@@ -148,6 +161,7 @@ namespace ScreenCompanion
 
     internal sealed class TrayMirrorForm : Form
     {
+        private readonly TrayCaptureBackend capture;
         private readonly PictureBox picture=new PictureBox();
         private readonly System.Windows.Forms.Timer timer=new System.Windows.Forms.Timer();
         private readonly System.Windows.Forms.Timer revealTimer=new System.Windows.Forms.Timer();
@@ -160,10 +174,11 @@ namespace ScreenCompanion
         private float pendingX,pendingY;
         private MouseButtons pendingButton;
         private int revealAttempts;
+        private int frameGeneration,revealFrameGeneration;
         private Point revealPoint;
         private Rectangle stableSource;
         private int sourceStableSince;
-        private readonly TrayPointerLease pointer=new TrayPointerLease(delegate{return Cursor.Position;},Native.MovePointer,Native.ClickAndRestore,2400);
+        private readonly TrayPointerLease pointer;
         private int capturePausedUntil=Environment.TickCount;
         private bool openingOverflow;
         private int clickStarted;
@@ -192,31 +207,44 @@ namespace ScreenCompanion
         private int lastClockSecond=-1;
         private bool started;
         private bool closing;
-        private int autoRevealAfter=Environment.TickCount;
         private bool overflowKnown;
-        internal TrayMirrorForm(Action settings)
+        private bool waitingForSource;
+        private uint lastSourceDpi;
+        private int nextCaptureAttempt=Environment.TickCount;
+        private int nextPresentAttempt=Environment.TickCount;
+        private bool surfacePending;
+        private int nextRetryRequest=Environment.TickCount;
+        internal bool FrameReady{get{return lastTrayFrame!=null;}}
+        internal bool WaitingForSource{get{return waitingForSource;}}
+        internal TrayMirrorForm(Action settings):this(settings,null,null){}
+        internal TrayMirrorForm(Action settings,TrayCaptureBackend backend,TrayPointerLease input)
         {
+            capture=backend ?? new TrayCaptureBackend{
+                TargetScreen=Settings.TargetScreen,TargetTaskbar=FindTargetTaskbar,ReadTargetExposure=ReadTaskbarExposure,
+                FindPrimaryTray=FindTrayBounds,PrimaryContentReady=SourceVisible,Capture=CaptureScreen,
+                PrimaryDpi=delegate{return Native.Dpi(Native.FindWindow("Shell_TrayWnd",null));}};
+            pointer=input ?? new TrayPointerLease(delegate{return Cursor.Position;},Native.MovePointer,Native.ClickAndRestore,2400);
             Text="副屏真实托盘";FormBorderStyle=FormBorderStyle.None;ShowInTaskbar=false;StartPosition=FormStartPosition.Manual;TopMost=true;AutoScaleMode=AutoScaleMode.None;
             BackColor=Color.FromArgb(35,39,47);ClientSize=new Size(440,48);
             picture.Dock=DockStyle.Fill;picture.SizeMode=PictureBoxSizeMode.StretchImage;Controls.Add(picture);
             gear.Text="⚙";gear.Dock=DockStyle.Left;gear.Width=30;gear.Font=new Font("Segoe UI",14);gear.TextAlign=ContentAlignment.MiddleCenter;gear.ForeColor=Color.White;gear.Cursor=Cursors.Hand;Controls.Add(gear);
-            var menu=new ContextMenuStrip();menu.Items.Add("打开副屏助手设置",null,delegate{settings();});menu.Items.Add("刷新托盘画面",null,delegate{CaptureTray();});gear.ContextMenuStrip=menu;gear.Click+=delegate{settings();};
-            var tip=new ToolTip();tip.SetToolTip(gear,"副屏助手设置");tip.SetToolTip(picture,"真实系统托盘 · 支持左键、右键和双击\n箭头在副屏展开真实隐藏图标菜单，菜单图标可直接操作。\n主屏隐藏时保留图标画面，点击会先展开真实托盘。");
+            var menu=new ContextMenuStrip();menu.Items.Add("打开副屏助手设置",null,delegate{settings();});menu.Items.Add("重新加载主屏托盘",null,delegate{RetryLoad();});gear.ContextMenuStrip=menu;gear.Click+=delegate{settings();};
+            var tip=new ToolTip();tip.SetToolTip(gear,"副屏助手设置");tip.SetToolTip(picture,"真实系统托盘 · 支持左键、右键和双击\n未就绪时点击加载；主屏隐藏时会短暂展开，移动鼠标即可取消。\n齿轮始终可以打开设置。");
             picture.MouseUp+=Forward;
             timer.Interval=ResponsePolicy.TrayPoll;timer.Tick+=delegate
             {
-                if(!forwarding){CaptureTray();return;}
+                if(!forwarding){CaptureSafely();return;}
                 // Native auto-hide continues during a primary-tray reveal.
                 // Visibility tracking must not pause with expensive capture.
-                Screen target=Settings.TargetScreen();Rectangle bar;
-                if((target==null || !ReadTaskbarExposure(taskbarHost,target.Bounds,out bar)) && Visible)Hide();
+                Screen target=capture.TargetScreen();Rectangle bar;
+                if((target==null || !capture.ReadTargetExposure(taskbarHost,target.Bounds,out bar)) && Visible)Hide();
             };
             popupTimer.Interval=16;popupTimer.Tick+=delegate{TrackOverflow();};
             revealTimer.Interval=16;revealTimer.Tick+=delegate
             {
                 if(!pointer.IsOwned){EndForward();return;}
-                source=FindTrayBounds();
-                if(SourceVisible(source))
+                source=capture.FindPrimaryTray();
+                if(capture.PrimaryContentReady(source))
                 {
                     // The auto-hide rectangle reaches its final position before
                     // the XAML buttons finish animating. Wait for stable geometry
@@ -231,16 +259,16 @@ namespace ScreenCompanion
                         if(++revealAttempts<100)return;
                         Text="真实托盘尚未就绪，点击重试";EndForward();return;
                     }
-                    revealTimer.Stop();
                     if(pendingClick && pointer.IsOwned)
                     {
+                        revealTimer.Stop();
                         Point p=MapPoint(pendingX,pendingY,source);LastClickPoint=p;LastInputTarget=Native.WindowFromPoint(p);
                         // Keep capture/matting work outside the pointer lease.
                         // Native dispatch and return are one ordered input batch.
                         flyouts.Begin(p,returnCursor);LastInputSucceeded=pointer.Click(p,pendingButton);
+                        EndForward();
                     }
-                    else if(!pendingClick)CaptureTray();
-                    EndForward();
+                    else if(!pendingClick)RefreshManualReveal();
                 }
                 else if(++revealAttempts>=75){Text="托盘未能展开，点击重试";EndForward();}
             };
@@ -252,7 +280,40 @@ namespace ScreenCompanion
             if(started || IsDisposed || Disposing)return;
             // CaptureTray may Place -> Show -> Shown. Mark initialization before
             // that path, and let Place alone decide whether the bar is exposed.
-            started=true;IntPtr ownHandle=Handle;InstallPopupHooks();timer.Start();CaptureTray();
+            started=true;IntPtr ownHandle=Handle;if(capture.EnableInputHooks)InstallPopupHooks();timer.Start();CaptureSafely();
+        }
+        internal void CaptureNow(){nextCaptureAttempt=nextPresentAttempt=capturePausedUntil=Environment.TickCount;CaptureSafely();}
+        private void CaptureSafely()
+        {
+            if(closing || IsDisposed)return;
+            try{CaptureTray();}
+            catch{nextCaptureAttempt=nextPresentAttempt=Environment.TickCount+500;surfacePending=true;}
+        }
+        internal void RetryLoad()
+        {
+            if(closing || forwarding || pointer.RestorationPending)return;
+            int now=Environment.TickCount;
+            if(now-nextRetryRequest<0 || now-nextCaptureAttempt<0 || now-nextPresentAttempt<0 || now-capturePausedUntil<0)return;
+            nextRetryRequest=now+1500;CaptureSafely();
+            // If source pixels are already exposed, passive retry is sufficient.
+            // A click never bypasses a failed-capture/presentation cooldown.
+            if(!capture.PrimaryContentReady(source))BeginReveal(false);
+        }
+        internal void RefreshManualReveal()
+        {
+            if(!pointer.IsOwned){EndForward();return;}
+            // Stable XAML geometry can precede the first rendered icons. Keep
+            // this one user-requested reveal alive through capture cooldowns;
+            // an old cached frame is not completion of the current request.
+            CaptureSafely();
+            if(frameGeneration!=revealFrameGeneration){EndForward();return;}
+            if(++revealAttempts>=100){Text="真实托盘画面尚未就绪，点击重试";EndForward();}
+        }
+        internal bool FrameMatchesSource(Rectangle bounds)
+        {
+            // Native auto-hide translates the whole source without changing its
+            // relative button mapping. Size or DPI changes invalidate that map.
+            return FrameReady && !bounds.IsEmpty && bounds.Size==lastTraySource.Size && capture.PrimaryDpi()==lastSourceDpi;
         }
         protected override bool ShowWithoutActivation{get{return true;}}
         protected override CreateParams CreateParams{get{var p=base.CreateParams;p.ExStyle|=0x80|0x08000000|0x80000;return p;}}
@@ -267,52 +328,57 @@ namespace ScreenCompanion
         }
         private void CaptureTray()
         {
-            Screen target=Settings.TargetScreen();if(target==null){Hide();return;}
+            Screen target=capture.TargetScreen();if(target==null){Hide();return;}
             IntPtr host=taskbarHost;
-            if(host==IntPtr.Zero || !Native.IsWindow(host) || Screen.FromHandle(host).DeviceName!=target.DeviceName)host=FindTargetTaskbar();
+            if(host==IntPtr.Zero || !Native.IsWindow(host) || Screen.FromHandle(host).DeviceName!=target.DeviceName)host=capture.TargetTaskbar();
             if(host==IntPtr.Zero){Hide();return;}
             // Remember a valid host even while hidden, avoiding EnumWindows on
             // every poll. Its visibility is independent of passive source warmup.
             taskbarHost=host;Rectangle bar;
-            bool exposed=ReadTaskbarExposure(host,target.Bounds,out bar);
+            bool exposed=capture.ReadTargetExposure(host,target.Bounds,out bar);
             if(!exposed && Visible)Hide();
-            source=FindTrayBounds();
-            if(source.IsEmpty)
-            {
-                if(!exposed)return;
-                if(picture.Image!=null){picture.Image.Dispose();picture.Image=null;}
-                picture.BackColor=BackColor;picture.Invalidate();
-                Text="副屏托盘：主屏托盘隐藏或无法识别";
-                using(var b=new Bitmap(330,42))using(var g=Graphics.FromImage(b)){g.Clear(BackColor);TextRenderer.DrawText(g,"主屏托盘隐藏 / 暂不可捕获",Font,new Rectangle(8,0,322,42),Color.White,TextFormatFlags.VerticalCenter);SetImage((Bitmap)b.Clone());}
-                Place(target,bar,360,bar.Height);return;
-            }
+            source=capture.FindPrimaryTray();
             int maxWidth=Math.Min(Settings.Current.TrayWidth,Math.Max(100,target.Bounds.Width-46));
             int h=bar.Height;
-            double scale=Math.Min(h/(double)source.Height,maxWidth/(double)source.Width);int w=Math.Max(40,(int)(source.Width*scale));
-            if(!SourceVisible(source))
-            {
-                Text="主屏已隐藏；保留上次托盘画面，点击展开操作";
-                if(exposed && picture.Image==null && !forwarding && Environment.TickCount-autoRevealAfter>=0)BeginReveal(false);
-                else if(exposed && picture.Image!=null)RefreshHiddenClock();
-                if(exposed && picture.Image!=null)Place(target,bar,w+30,h);
-                return;
-            }
+            Size layout=source.IsEmpty?new Size(330,42):source.Size;
+            double scale=Math.Min(h/(double)Math.Max(1,layout.Height),maxWidth/(double)Math.Max(1,layout.Width));int w=Math.Max(120,(int)(layout.Width*scale));
             // Warm a real frame whenever primary pixels exist, including while
             // the secondary taskbar is hidden. Never show an unpainted mirror.
-            if(Environment.TickCount-capturePausedUntil>=0 && (Environment.TickCount-lastFrame>=ResponsePolicy.TrayFrame || picture.Image==null))
+            if(!source.IsEmpty && Environment.TickCount-capturePausedUntil>=0 && Environment.TickCount-nextCaptureAttempt>=0 && capture.PrimaryContentReady(source))
             {
-                lastFrame=Environment.TickCount;Text="副屏真实托盘";Bitmap image=null;
+                lastFrame=Environment.TickCount;nextCaptureAttempt=lastFrame+ResponsePolicy.TrayFrame;Bitmap image=null;
                 try
                 {
-                    image=new Bitmap(source.Width,source.Height,PixelFormat.Format32bppPArgb);
-                    using(var g=Graphics.FromImage(image))g.CopyFromScreen(source.Location,Point.Empty,source.Size);
-                    if(lastTrayFrame!=null)lastTrayFrame.Dispose();lastTrayFrame=(Bitmap)image.Clone();
-                    lastTraySource=source;SetImage(image);image=null;
+                    image=capture.Capture(source);
+                    if(!TryAcceptFrame(image,source,capture.PrimaryContentReady(source)))nextCaptureAttempt=Environment.TickCount+500;
                 }
-                catch { Text="副屏托盘：屏幕暂不可捕获"; }
+                catch { nextCaptureAttempt=Environment.TickCount+500;Text="托盘画面暂不可用，保留最近画面"; }
                 finally{if(image!=null)image.Dispose();}
             }
-            if(exposed && picture.Image!=null)Place(target,bar,w+30,h);
+            bool wait=!FrameMatchesSource(source);
+            if(wait)ShowWaitingFrame();
+            else
+            {
+                if(waitingForSource){waitingForSource=false;RenderSurface();}
+                if(exposed && !capture.PrimaryContentReady(source))RefreshHiddenClock();
+            }
+            if(exposed)Place(target,bar,w+30,h);
+        }
+        private static Bitmap CaptureScreen(Rectangle rectangle)
+        {
+            var bitmap=new Bitmap(rectangle.Width,rectangle.Height,PixelFormat.Format32bppPArgb);
+            try{using(var g=Graphics.FromImage(bitmap))g.CopyFromScreen(rectangle.Location,Point.Empty,rectangle.Size);return bitmap;}
+            catch{bitmap.Dispose();throw;}
+        }
+        private void ShowWaitingFrame()
+        {
+            bool changed=!waitingForSource;waitingForSource=true;Text="托盘未就绪，点击加载；齿轮可打开设置";
+            if(picture.Image==null)
+            {
+                var image=new Bitmap(330,42,PixelFormat.Format32bppPArgb);using(var g=Graphics.FromImage(image))g.Clear(BackColor);
+                picture.Image=image;changed=true;
+            }
+            if(changed)RenderSurface();
         }
         internal static IntPtr FindTargetTaskbar()
         {
@@ -331,13 +397,21 @@ namespace ScreenCompanion
             // Match the target taskbar's physical height, including per-screen DPI.
             // Capture and background separation can take time. Never show from
             // the earlier rectangle after the native taskbar has hidden.
-            if(!ReadTaskbarExposure(taskbarHost,screen.Bounds,out bar)){if(Visible)Hide();return;}
+            if(!capture.ReadTargetExposure(taskbarHost,screen.Bounds,out bar)){if(Visible)Hide();return;}
             h=bar.Height;
             var desired=new Rectangle(bar.Right-w,bar.Top,w,h);
             bool resized=Bounds.Size!=desired.Size;
-            if(!Visible){Show();Native.SetWindowPos(Handle,new IntPtr(-1),desired.X,desired.Y,w,h,0x10|0x40);}
-            else if(Bounds!=desired)Native.SetWindowPos(Handle,new IntPtr(-1),desired.X,desired.Y,w,h,0x10|0x40);
-            if(resized && picture.Image!=null)RenderSurface();
+            bool show=!Visible;
+            // Prepare geometry and the layer before first exposure, so a
+            // waiting/ready surface cannot briefly appear at the default 0,0.
+            if(Bounds!=desired)Native.SetWindowPos(Handle,new IntPtr(-1),desired.X,desired.Y,w,h,0x10);
+            if((show || resized || surfacePending) && picture.Image!=null && !RenderSurface())return;
+            if(show)
+            {
+                Rectangle live;
+                if(!capture.ReadTargetExposure(taskbarHost,screen.Bounds,out live) || live!=bar){Hide();return;}
+                Show();
+            }
         }
         internal static bool TaskbarExposed(Rectangle screen,Rectangle bar,bool visible,bool cloaked)
         {
@@ -376,22 +450,102 @@ namespace ScreenCompanion
         {
             if(Settings.Current.TransparentTray)
             {
-                Bitmap reference=null;
-                if(Settings.Current.WallpaperAwareTray && !lastTraySource.IsEmpty && lastTraySource.Size==b.Size)
-                {
-                    if(wallpaper==null)wallpaper=new WallpaperBackdrop();
-                    reference=wallpaper.Get(lastTraySource,Screen.FromRectangle(lastTraySource).Bounds,SystemInformation.VirtualScreen);
-                }
-                try{Bitmap transparent=TraySurface.SeparateBackground(b,ResponsePolicy.High?pixels:null,reference);b.Dispose();b=transparent;}
-                finally{if(reference!=null)reference.Dispose();}
+                Bitmap transparent=SeparateFrame(b,lastTraySource);b.Dispose();b=transparent;
+                if(FrameReady && picture.Image!=null && !HasVisibleTrayContent(b,capture.PrimaryDpi())){b.Dispose();return;}
             }
-            Image old=picture.Image;picture.Image=b;if(old!=null)old.Dispose();RenderSurface();
+            Image old=picture.Image;picture.Image=b;
+            if(!RenderSurface()){picture.Image=old;b.Dispose();return;}
+            if(old!=null)old.Dispose();
         }
-        private void RenderSurface()
+        private Bitmap SeparateFrame(Bitmap raw,Rectangle bounds)
         {
-            if(!IsHandleCreated || Width<31 || Height<1 || picture.Image==null)return;
-            using(var surface=new Bitmap(Width,Height,PixelFormat.Format32bppPArgb))using(var g=Graphics.FromImage(surface))
+            Bitmap reference=null;
+            if(Settings.Current.WallpaperAwareTray && !bounds.IsEmpty && bounds.Size==raw.Size)
             {
+                if(wallpaper==null)wallpaper=new WallpaperBackdrop();
+                reference=wallpaper.Get(bounds,Screen.FromRectangle(bounds).Bounds,SystemInformation.VirtualScreen);
+            }
+            try{return TraySurface.SeparateBackground(raw,ResponsePolicy.High?pixels:null,reference);}
+            finally{if(reference!=null)reference.Dispose();}
+        }
+        internal bool TryAcceptFrame(Bitmap raw,Rectangle bounds,bool sourceConfirmed)
+        {
+            // The caller retains raw on both paths. Only a fully prepared valid
+            // candidate can replace either half of the previous raw/matte pair.
+            if(!sourceConfirmed || raw==null || bounds.IsEmpty || raw.Size!=bounds.Size)return false;
+            Bitmap separated=null,nextRaw=null,nextDisplay=null;
+            try
+            {
+                separated=SeparateFrame(raw,bounds);uint dpi=capture.PrimaryDpi();
+                if(!HasVisibleTrayContent(separated,dpi))return false;
+                nextRaw=(Bitmap)raw.Clone();nextDisplay=Settings.Current.TransparentTray?separated:(Bitmap)raw.Clone();
+                if(Settings.Current.TransparentTray)separated=null;
+                Image previousDisplay=picture.Image;Bitmap previousRaw=lastTrayFrame;
+                Rectangle previousSource=lastTraySource;uint previousDpi=lastSourceDpi;bool previousWaiting=waitingForSource;string previousText=Text;
+                lastTrayFrame=nextRaw;lastTraySource=bounds;lastSourceDpi=dpi;
+                picture.Image=nextDisplay;waitingForSource=false;Text="副屏真实托盘";
+                if(!RenderSurface())
+                {
+                    lastTrayFrame=previousRaw;lastTraySource=previousSource;lastSourceDpi=previousDpi;
+                    picture.Image=previousDisplay;waitingForSource=previousWaiting;Text=previousText;
+                    return false;
+                }
+                nextRaw=nextDisplay=null;
+                if(previousDisplay!=null)previousDisplay.Dispose();if(previousRaw!=null)previousRaw.Dispose();
+                unchecked{frameGeneration++;}
+                return true;
+            }
+            finally{if(separated!=null)separated.Dispose();if(nextRaw!=null)nextRaw.Dispose();if(nextDisplay!=null)nextDisplay.Dispose();}
+        }
+        internal static int EstimatedClockWidth(Size size,uint dpi)
+        {
+            return (int)Math.Min(size.Width,Math.Max(82L*Math.Max(96u,dpi)/96,(long)size.Height*7/4));
+        }
+        private static int MaskedClockWidth(Size size,uint dpi){return Math.Min(size.Width/2,EstimatedClockWidth(size,dpi));}
+        internal static bool HasVisibleTrayContent(Bitmap separated,uint dpi)
+        {
+            if(separated==null || separated.Width<1 || separated.Height<1)return false;
+            // Inspect exactly the source area that survives ComposeSurface's
+            // clock mask, including for narrow sources. Do not accept pixels
+            // that the final layer would immediately erase.
+            int width=separated.Width-MaskedClockWidth(separated.Size,dpi);
+            BitmapData data=separated.LockBits(new Rectangle(0,0,separated.Width,separated.Height),ImageLockMode.ReadOnly,PixelFormat.Format32bppPArgb);
+            try
+            {
+                var row=new byte[width*4];
+                for(int y=0;y<separated.Height;y++)
+                {
+                    System.Runtime.InteropServices.Marshal.Copy(IntPtr.Add(data.Scan0,y*data.Stride),row,0,row.Length);
+                    for(int x=0;x<width;x++)if(row[x*4+3]!=0)return true;
+                }
+                return false;
+            }
+            finally{separated.UnlockBits(data);}
+        }
+        private bool RenderSurface()
+        {
+            if(!IsHandleCreated)return true; // Valid warm cache before a native surface exists.
+            if(Width<31 || Height<1 || picture.Image==null)return false;
+            if(Environment.TickCount-nextPresentAttempt<0){surfacePending=true;return false;}
+            try
+            {
+                using(var surface=ComposeSurface())
+                {
+                    if(capture.PresentSurface!=null)capture.PresentSurface(Handle,surface,Location);
+                    else TraySurface.Present(Handle,surface,Location);
+                }
+                surfacePending=false;return true;
+            }
+            catch{surfacePending=true;nextPresentAttempt=Environment.TickCount+500;return false;}
+        }
+        internal Bitmap ComposeSurface()
+        {
+            if(Width<31 || Height<1 || picture.Image==null)return null;
+            var surface=new Bitmap(Width,Height,PixelFormat.Format32bppPArgb);
+            try
+            {
+                using(var g=Graphics.FromImage(surface))
+                {
                 // Alpha 1 retains click input in the spaces around tray glyphs.
                 g.Clear(Settings.Current.TransparentTray?Color.FromArgb(1,0,0,0):BackColor);
                 g.DrawImage(picture.Image,new Rectangle(30,0,Width-30,Height));
@@ -399,18 +553,27 @@ namespace ScreenCompanion
                 {
                     // The secondary taskbar already draws its own clock. Expose
                     // that clock rather than stacking primary-monitor glyphs.
-                    int sourceClock=Math.Min(picture.Image.Width/2,Math.Max(82,picture.Image.Height*7/4));
+                    int sourceClock=MaskedClockWidth(picture.Image.Size,capture.PrimaryDpi());
                     int clock=(int)Math.Ceiling(sourceClock*(Width-30)/(double)picture.Image.Width);
                     g.CompositingMode=System.Drawing.Drawing2D.CompositingMode.SourceCopy;
                     using(var clear=new SolidBrush(Color.Transparent))g.FillRectangle(clear,Width-clock,0,clock,Height);
                     g.CompositingMode=System.Drawing.Drawing2D.CompositingMode.SourceOver;
                 }
                 using(var b=new SolidBrush(BackColor))g.FillRectangle(b,0,0,30,Height);
-                if(overflowKnown || FindOverflowWindow()!=IntPtr.Zero)DrawOverflowIndicator(g,(Bitmap)picture.Image,new Rectangle(30,0,Width-30,Height),Settings.Current.TransparentTray,
-                    openingOverflow || managedOverflow || FindOverflowWindow()!=IntPtr.Zero,Native.Dpi(Native.FindWindow("Shell_TrayWnd",null)));
+                if(waitingForSource)
+                {
+                    int clock=Settings.Current.TransparentTray?(int)Math.Ceiling(MaskedClockWidth(picture.Image.Size,capture.PrimaryDpi())*(Width-30)/(double)picture.Image.Width):0;
+                    Rectangle message=new Rectangle(30,0,Math.Max(1,Width-30-clock),Height);
+                    using(var fill=new SolidBrush(BackColor))g.FillRectangle(fill,message);
+                    TextRenderer.DrawText(g,"托盘未就绪 · 点击加载",Font,message,Color.White,TextFormatFlags.VerticalCenter|TextFormatFlags.HorizontalCenter|TextFormatFlags.EndEllipsis);
+                }
+                else if(overflowKnown || FindOverflowWindow()!=IntPtr.Zero)DrawOverflowIndicator(g,(Bitmap)picture.Image,new Rectangle(30,0,Width-30,Height),Settings.Current.TransparentTray,
+                    openingOverflow || managedOverflow || FindOverflowWindow()!=IntPtr.Zero,capture.PrimaryDpi());
                 using(var font=new Font("Segoe UI",14))using(var b=new SolidBrush(Color.White))using(var format=new StringFormat{Alignment=StringAlignment.Center,LineAlignment=StringAlignment.Center})g.DrawString("⚙",font,b,new RectangleF(0,0,30,Height),format);
-                TraySurface.Present(Handle,surface,Location);
+                }
+                return surface;
             }
+            catch{surface.Dispose();throw;}
         }
         internal static void DrawOverflowIndicator(Graphics graphics,Bitmap image,Rectangle destination,bool transparent,bool expanded,uint dpi)
         {
@@ -467,7 +630,9 @@ namespace ScreenCompanion
         {
             ForwardCount++;
             picture.Capture=false;
-            if(source.IsEmpty || forwarding || (e.Button!=MouseButtons.Left && e.Button!=MouseButtons.Right))return;
+            if(forwarding || (e.Button!=MouseButtons.Left && e.Button!=MouseButtons.Right))return;
+            Rectangle live=capture.FindPrimaryTray();
+            if(waitingForSource || !FrameMatchesSource(live)){RetryLoad();return;}
             bool arrow=e.Button==MouseButtons.Left && e.X/(float)Math.Max(1,picture.Width)*source.Width<32L*Native.Dpi(Native.FindWindow("Shell_TrayWnd",null))/96;
             if(arrow)
             {
@@ -476,17 +641,30 @@ namespace ScreenCompanion
                 clickStarted=Environment.TickCount;LastPopupLatency=-1;openingOverflow=true;popupTimer.Interval=16;popupTimer.Start();
             }
             // Recheck the source; a layout change must never click a stale coordinate.
-            Rectangle live=FindTrayBounds();
             pendingX=e.X/(float)Math.Max(1,picture.Width);pendingY=e.Y/(float)Math.Max(1,picture.Height);pendingButton=e.Button;
             source=live;
             // Dispatch after the original MouseUp has released all capture and
             // after the native primary taskbar is ready to receive the input.
             BeginReveal(true);
         }
+        internal static bool SourceGeometryReady(Rectangle source,Rectangle screen,Rectangle bar,bool barExposed,bool notifyVisible,bool sourceMatches,bool unoccluded)
+        {
+            return !source.IsEmpty && screen.Contains(source) && bar.Contains(source) && barExposed && notifyVisible && sourceMatches && unoccluded;
+        }
         private static bool SourceVisible(Rectangle r)
         {
             IntPtr taskbar=Native.FindWindow("Shell_TrayWnd",null);
-            return !r.IsEmpty && taskbar!=IntPtr.Zero && Screen.FromHandle(taskbar).Bounds.Contains(r);
+            if(r.IsEmpty || taskbar==IntPtr.Zero || !Native.IsWindow(taskbar))return false;
+            IntPtr notify=Native.FindWindowEx(taskbar,IntPtr.Zero,"TrayNotifyWnd",null);
+            Rectangle screen=Screen.FromHandle(taskbar).Bounds,bar;
+            bool exposed=ReadTaskbarExposure(taskbar,screen,out bar);
+            if(!SourceGeometryReady(r,screen,bar,exposed,Native.IsWindowVisible(notify),Native.Bounds(notify)==r,true))return false;
+            int cloak;if(Native.DwmGetWindowAttribute(notify,14,out cloak,4)==0 && cloak!=0)return false;
+            // Test several independent icon/clock positions. Occluding windows
+            // must not be captured and committed as a new tray frame.
+            foreach(Point point in new[]{MapPoint(.12f,.5f,r),MapPoint(.4f,.3f,r),MapPoint(.6f,.7f,r),MapPoint(.88f,.5f,r)})
+                if(Native.GetAncestor(Native.WindowFromPoint(point),2)!=taskbar)return false;
+            return true;
         }
         private static Point MapPoint(float x,float y,Rectangle r){return new Point(r.X+Math.Max(0,Math.Min(r.Width-1,(int)(x*r.Width))),r.Y+Math.Max(0,Math.Min(r.Height-1,(int)(y*r.Height))));}
         internal static IntPtr FindOverflowWindow()
@@ -548,7 +726,7 @@ namespace ScreenCompanion
             }
             movedPopup=IntPtr.Zero;
 
-            if(!closing && lastTrayFrame!=null && !SourceVisible(FindTrayBounds()))RefreshHiddenClockCore(true);
+            if(!closing && lastTrayFrame!=null && !capture.PrimaryContentReady(capture.FindPrimaryTray()))RefreshHiddenClockCore(true);
         }
         private void InstallPopupHooks()
         {
@@ -627,15 +805,14 @@ namespace ScreenCompanion
             IntPtr taskbar=Native.FindWindow("Shell_TrayWnd",null);if(taskbar==IntPtr.Zero)return;
             Rectangle b=Screen.FromHandle(taskbar).Bounds,tr=Native.Bounds(taskbar);
             if(!pointer.Begin(Cursor.Position))return;
-            returnCursor=pointer.Origin;pendingClick=click;revealAttempts=0;forwarding=true;stableSource=Rectangle.Empty;
-            if(!click)autoRevealAfter=Environment.TickCount+1500;
+            returnCursor=pointer.Origin;pendingClick=click;revealAttempts=0;revealFrameGeneration=frameGeneration;forwarding=true;stableSource=Rectangle.Empty;
             int x=Math.Max(b.Left,Math.Min(b.Right-2,tr.Right-70));int y=Math.Max(b.Top,Math.Min(b.Bottom-1,tr.Top+2));
             if(tr.Height>tr.Width){x=Math.Max(b.Left,Math.Min(b.Right-1,tr.Left+2));y=Math.Max(b.Top,Math.Min(b.Bottom-2,tr.Bottom-70));}
-            Rectangle live=FindTrayBounds();
+            Rectangle live=capture.FindPrimaryTray();
             revealPoint=new Point(x,y);
             // Visible tray needs no hover warp: validate its hit and geometry
             // while the pointer remains exactly where the user clicked.
-            if(!SourceVisible(live) && !pointer.Move(revealPoint)){EndForward();return;}
+            if(!capture.PrimaryContentReady(live) && !pointer.Move(revealPoint)){EndForward();return;}
             Text="正在展开真实托盘…";revealTimer.Start();
         }
         private void EndForward(){revealTimer.Stop();pendingClick=false;pointer.Finish();forwarding=false;capturePausedUntil=Environment.TickCount+450;}

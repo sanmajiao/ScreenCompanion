@@ -82,6 +82,7 @@ namespace ScreenCompanion
         private SettingsForm settings;
         private readonly System.Windows.Forms.Timer topologyTimer=new System.Windows.Forms.Timer();
         private string topology="";
+        private string workAreas="";
         internal CompanionContext(EventWaitHandle signal,EventWaitHandle quit,bool show)
         {
             dispatcher.CreateControl(); IntPtr handle=dispatcher.Handle;
@@ -98,7 +99,7 @@ namespace ScreenCompanion
             quitWait=ThreadPool.RegisterWaitForSingleObject(quit,delegate { Dispatch(ExitThread); },null,Timeout.Infinite,false);
             SystemEvents.DisplaySettingsChanged+=DisplayChanged;
             // Low-rate topology check also recovers after Explorer restarts.
-            topologyTimer.Interval=3000;topologyTimer.Tick+=delegate { string t=Topology();if(t!=topology)Apply(); };topologyTimer.Start();
+            topologyTimer.Interval=3000;topologyTimer.Tick+=delegate{RefreshTopology();};topologyTimer.Start();
             Apply(); if(show)ShowSettings();
             // Retry once after the first message-loop turn. Construction can
             // precede Shell becoming ready to accept the notification icon.
@@ -117,15 +118,27 @@ namespace ScreenCompanion
             if(settings!=null && !settings.IsDisposed)settings.Hide();
         }
         private void Dispatch(Action a) { try { if(!dispatcher.IsDisposed)dispatcher.BeginInvoke(a); } catch { } }
-        private void DisplayChanged(object sender,EventArgs e) { Dispatch(Apply); }
+        private void DisplayChanged(object sender,EventArgs e) { Dispatch(RefreshTopology); }
+        private void RefreshTopology()
+        {
+            string t=Topology();if(t!=topology){Apply();return;}
+            string areas=WorkAreas();if(areas==workAreas)return;workAreas=areas;
+            // A work-area change must not discard the tray's valid frame.
+            if(desktop!=null)desktop.RefreshShellLayout();
+            if(switcher!=null)switcher.RefreshAvailableArea();
+        }
         private string Topology()
         {
-            var b=new StringBuilder();foreach(Screen s in Screen.AllScreens)b.Append(s.DeviceName).Append(s.Bounds).Append(s.WorkingArea);
+            var b=new StringBuilder();foreach(Screen s in Screen.AllScreens)b.Append(s.DeviceName).Append(s.Bounds);
             b.Append(Native.FindWindow("Progman",null));return b.ToString();
+        }
+        private string WorkAreas()
+        {
+            var b=new StringBuilder();foreach(Screen s in Screen.AllScreens)b.Append(s.DeviceName).Append(s.WorkingArea);return b.ToString();
         }
         internal void Apply()
         {
-            CloseFeatures(); topology=Topology();
+            CloseFeatures(); topology=Topology();workAreas=WorkAreas();
             if(Settings.TargetScreen()!=null)
             {
                 startMenu=new StartMenuController(dispatcher);
